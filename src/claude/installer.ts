@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const SKILL_CONTENT = `---
-name: codex-engine
+name: claude-ex
 description: >
   Local codebase intelligence via MCP. Use for: finding code, understanding
   architecture, tracing dependencies, impact analysis, finding callers,
@@ -12,7 +12,7 @@ description: >
   PREFER these MCP tools over grep/ripgrep for structural queries.
 ---
 
-# codex-engine — Codebase Intelligence (MCP)
+# claude-ex — Codebase Intelligence (MCP)
 
 This project has a live code index exposed via MCP. The MCP tools are
 **much faster and more precise than grep** for structural questions.
@@ -103,7 +103,7 @@ function installMcpConfig(rootDir: string): void {
 
     config.mcpServers.codex = {
         type: 'stdio',
-        command: 'codex-engine',
+        command: 'claude-ex',
         args: ['mcp'],
     };
 
@@ -131,30 +131,30 @@ function installHooks(rootDir: string): void {
 
     // SessionStart
     if (!config.hooks.SessionStart) config.hooks.SessionStart = [];
-    if (!config.hooks.SessionStart.some((h: any) => h.command?.includes('codex-engine'))) {
+    if (!config.hooks.SessionStart.some((h: any) => h.command?.includes('claude-ex'))) {
         config.hooks.SessionStart.push({
             matcher: '',
-            command: 'codex-engine brief',
+            command: 'claude-ex brief',
             timeout: 5000,
         });
     }
 
     // PreToolUse
     if (!config.hooks.PreToolUse) config.hooks.PreToolUse = [];
-    if (!config.hooks.PreToolUse.some((h: any) => h.command?.includes('codex-engine'))) {
+    if (!config.hooks.PreToolUse.some((h: any) => h.command?.includes('claude-ex'))) {
         config.hooks.PreToolUse.push({
             matcher: 'Write|Edit|MultiEdit',
-            command: 'codex-engine pre-edit "$TOOL_INPUT_FILE_PATH"',
+            command: 'claude-ex pre-edit "$(cat /dev/stdin | jq -r \'.tool_input.file_path\')"',
             timeout: 3000,
         });
     }
 
     // PostToolUse
     if (!config.hooks.PostToolUse) config.hooks.PostToolUse = [];
-    if (!config.hooks.PostToolUse.some((h: any) => h.command?.includes('codex-engine'))) {
+    if (!config.hooks.PostToolUse.some((h: any) => h.command?.includes('claude-ex'))) {
         config.hooks.PostToolUse.push({
             matcher: 'Write|Edit|MultiEdit',
-            command: 'codex-engine post-edit "$TOOL_INPUT_FILE_PATH"',
+            command: 'claude-ex post-edit "$(cat /dev/stdin | jq -r \'.tool_input.file_path\')"',
             timeout: 5000,
         });
     }

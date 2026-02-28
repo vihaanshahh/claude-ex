@@ -18,7 +18,7 @@ import { runMcpServer } from './claude/mcp';
 const program = new Command();
 
 program
-    .name('codex-engine')
+    .name('claude-ex')
     .description('Local code intelligence layer for Claude Code')
     .version('1.0.0');
 
@@ -33,7 +33,7 @@ function requireIndex(pathArg?: string): string {
     const root = resolveRoot(pathArg);
     const found = findProjectRoot(root);
     if (!found) {
-        process.stderr.write('Error: No codex index found. Run "codex-engine init" first.\n');
+        process.stderr.write('Error: No codex index found. Run "claude-ex init" first.\n');
         process.exit(1);
     }
     return found;
@@ -261,7 +261,7 @@ program
 // --- uninstall ---
 program
     .command('uninstall')
-    .description('Remove all codex-engine config from this project')
+    .description('Remove all claude-ex config from this project')
     .action(() => {
         const rootDir = resolveRoot();
         const fs = require('fs');
@@ -306,7 +306,7 @@ program
                     if (config.hooks?.[hookType]) {
                         const before = config.hooks[hookType].length;
                         config.hooks[hookType] = config.hooks[hookType].filter(
-                            (h: any) => !h.command?.includes('codex-engine')
+                            (h: any) => !h.command?.includes('claude-ex')
                         );
                         if (config.hooks[hookType].length !== before) changed = true;
                         if (config.hooks[hookType].length === 0) delete config.hooks[hookType];
@@ -320,7 +320,7 @@ program
             } catch { /* ignore */ }
         }
 
-        console.log('codex-engine uninstalled.');
+        console.log('claude-ex uninstalled.');
     });
 
 // --- daemon-worker (internal, not shown in help) ---

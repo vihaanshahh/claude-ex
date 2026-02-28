@@ -24,7 +24,7 @@ export async function runMcpServer(): Promise<void> {
         db = openDatabase(rootDir);
     } catch (err) {
         process.stderr.write(`[codex-mcp] Failed to open database: ${err}\n`);
-        process.stderr.write(`[codex-mcp] Run 'codex-engine init' first.\n`);
+        process.stderr.write(`[codex-mcp] Run 'claude-ex init' first.\n`);
         process.exit(1);
     }
 
@@ -39,7 +39,7 @@ export async function runMcpServer(): Promise<void> {
     }
 
     const server = new Server(
-        { name: 'codex-engine', version: '1.0.0' },
+        { name: 'claude-ex', version: '1.0.0' },
         { capabilities: { tools: {} } }
     );
 

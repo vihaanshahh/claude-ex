@@ -1,4 +1,4 @@
-# codex-engine
+# claude-ex
 
 Local code intelligence layer for Claude Code. Indexes your codebase into a SQLite graph database (symbols + dependency edges + PageRank), then runs as a persistent MCP server that Claude Code queries in real-time.
 
@@ -12,7 +12,7 @@ npm run build
 npm link
 
 cd /path/to/your/project
-codex-engine init
+claude-ex init
 ```
 
 Then open Claude Code — the MCP server starts automatically and gives Claude structural awareness of your entire codebase.
@@ -39,21 +39,21 @@ Then open Claude Code — the MCP server starts automatically and gives Claude s
 ## CLI Commands
 
 ```
-codex-engine init [path]         Index + install config + generate docs
-codex-engine search <query>      Search symbols
-codex-engine callers <symbol>    Find callers
-codex-engine context <symbol>    Full symbol context
-codex-engine impact <file>       Impact analysis
-codex-engine deps <symbol>       Dependencies
-codex-engine rank                Top symbols by PageRank
-codex-engine modules             Module map
-codex-engine stats               Index statistics
-codex-engine brief               Project summary (SessionStart hook)
-codex-engine pre-edit <file>     Pre-edit context (PreToolUse hook)
-codex-engine post-edit <file>    Post-edit reindex (PostToolUse hook)
-codex-engine generate-docs       Regenerate CLAUDE.md
-codex-engine mcp                 Run as MCP server
-codex-engine uninstall           Remove all config
+claude-ex init [path]         Index + install config + generate docs
+claude-ex search <query>      Search symbols
+claude-ex callers <symbol>    Find callers
+claude-ex context <symbol>    Full symbol context
+claude-ex impact <file>       Impact analysis
+claude-ex deps <symbol>       Dependencies
+claude-ex rank                Top symbols by PageRank
+claude-ex modules             Module map
+claude-ex stats               Index statistics
+claude-ex brief               Project summary (SessionStart hook)
+claude-ex pre-edit <file>     Pre-edit context (PreToolUse hook)
+claude-ex post-edit <file>    Post-edit reindex (PostToolUse hook)
+claude-ex generate-docs       Regenerate CLAUDE.md
+claude-ex mcp                 Run as MCP server
+claude-ex uninstall           Remove all config
 ```
 
 ## Supported Languages
