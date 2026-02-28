@@ -127,6 +127,14 @@ function installHooks(rootDir: string): void {
         }
     }
 
+    // Auto-allow codex MCP tools so users don't get prompted
+    if (!config.permissions) config.permissions = {};
+    if (!config.permissions.allow) config.permissions.allow = [];
+    const mcpPattern = 'mcp__codex__*';
+    if (!config.permissions.allow.includes(mcpPattern)) {
+        config.permissions.allow.push(mcpPattern);
+    }
+
     if (!config.hooks) config.hooks = {};
 
     // Helper to check if any hook entry already has a claude-ex command

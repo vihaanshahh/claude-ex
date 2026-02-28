@@ -20,7 +20,7 @@ const program = new Command();
 program
     .name('claude-ex')
     .description('Local code intelligence layer for Claude Code')
-    .version('1.0.0');
+    .version(require('../package.json').version);
 
 function resolveRoot(pathArg?: string): string {
     if (pathArg) return path.resolve(pathArg);
