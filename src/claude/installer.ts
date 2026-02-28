@@ -137,7 +137,7 @@ function installHooks(rootDir: string): void {
     if (!config.hooks.SessionStart) config.hooks.SessionStart = [];
     if (!hasClaudeEx(config.hooks.SessionStart)) {
         config.hooks.SessionStart.push({
-            matcher: {},
+            matcher: "",
             hooks: [{
                 type: 'command',
                 command: 'claude-ex brief',
@@ -146,30 +146,34 @@ function installHooks(rootDir: string): void {
         });
     }
 
-    // PreToolUse
+    // PreToolUse (Write, Edit, MultiEdit)
     if (!config.hooks.PreToolUse) config.hooks.PreToolUse = [];
     if (!hasClaudeEx(config.hooks.PreToolUse)) {
-        config.hooks.PreToolUse.push({
-            matcher: { tools: ['Write', 'Edit', 'MultiEdit'] },
-            hooks: [{
-                type: 'command',
-                command: 'claude-ex pre-edit "$(jq -r \'.tool_input.file_path\')"',
-                timeout: 3000,
-            }],
-        });
+        for (const tool of ['Write', 'Edit', 'MultiEdit']) {
+            config.hooks.PreToolUse.push({
+                matcher: tool,
+                hooks: [{
+                    type: 'command',
+                    command: 'claude-ex pre-edit "$(jq -r \'.tool_input.file_path\')"',
+                    timeout: 3000,
+                }],
+            });
+        }
     }
 
-    // PostToolUse
+    // PostToolUse (Write, Edit, MultiEdit)
     if (!config.hooks.PostToolUse) config.hooks.PostToolUse = [];
     if (!hasClaudeEx(config.hooks.PostToolUse)) {
-        config.hooks.PostToolUse.push({
-            matcher: { tools: ['Write', 'Edit', 'MultiEdit'] },
-            hooks: [{
-                type: 'command',
-                command: 'claude-ex post-edit "$(jq -r \'.tool_input.file_path\')"',
-                timeout: 5000,
-            }],
-        });
+        for (const tool of ['Write', 'Edit', 'MultiEdit']) {
+            config.hooks.PostToolUse.push({
+                matcher: tool,
+                hooks: [{
+                    type: 'command',
+                    command: 'claude-ex post-edit "$(jq -r \'.tool_input.file_path\')"',
+                    timeout: 5000,
+                }],
+            });
+        }
     }
 
     fs.writeFileSync(settingsPath, JSON.stringify(config, null, 2) + '\n');
