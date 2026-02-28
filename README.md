@@ -7,15 +7,13 @@ Zero cloud. Zero API keys. Zero extra cost. Just your existing Claude Code subsc
 ## Quick Start
 
 ```bash
-npm install
-npm run build
-npm link
+npm i -g claude-ex
 
 cd /path/to/your/project
 claude-ex init
 ```
 
-Then open Claude Code — the MCP server starts automatically and gives Claude structural awareness of your entire codebase.
+That's it. Open Claude Code — the MCP server starts automatically and gives Claude structural awareness of your entire codebase.
 
 ## How It Works
 
