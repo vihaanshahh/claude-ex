@@ -306,7 +306,7 @@ program
                     if (config.hooks?.[hookType]) {
                         const before = config.hooks[hookType].length;
                         config.hooks[hookType] = config.hooks[hookType].filter(
-                            (h: any) => !h.command?.includes('claude-ex')
+                            (e: any) => !e.hooks?.some((h: any) => h.command?.includes('claude-ex'))
                         );
                         if (config.hooks[hookType].length !== before) changed = true;
                         if (config.hooks[hookType].length === 0) delete config.hooks[hookType];

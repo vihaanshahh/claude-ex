@@ -129,33 +129,46 @@ function installHooks(rootDir: string): void {
 
     if (!config.hooks) config.hooks = {};
 
+    // Helper to check if any hook entry already has a claude-ex command
+    const hasClaudeEx = (entries: any[]) =>
+        entries.some((e: any) => e.hooks?.some((h: any) => h.command?.includes('claude-ex')));
+
     // SessionStart
     if (!config.hooks.SessionStart) config.hooks.SessionStart = [];
-    if (!config.hooks.SessionStart.some((h: any) => h.command?.includes('claude-ex'))) {
+    if (!hasClaudeEx(config.hooks.SessionStart)) {
         config.hooks.SessionStart.push({
-            matcher: '',
-            command: 'claude-ex brief',
-            timeout: 5000,
+            matcher: {},
+            hooks: [{
+                type: 'command',
+                command: 'claude-ex brief',
+                timeout: 5000,
+            }],
         });
     }
 
     // PreToolUse
     if (!config.hooks.PreToolUse) config.hooks.PreToolUse = [];
-    if (!config.hooks.PreToolUse.some((h: any) => h.command?.includes('claude-ex'))) {
+    if (!hasClaudeEx(config.hooks.PreToolUse)) {
         config.hooks.PreToolUse.push({
-            matcher: 'Write|Edit|MultiEdit',
-            command: 'claude-ex pre-edit "$(cat /dev/stdin | jq -r \'.tool_input.file_path\')"',
-            timeout: 3000,
+            matcher: { tools: ['Write', 'Edit', 'MultiEdit'] },
+            hooks: [{
+                type: 'command',
+                command: 'claude-ex pre-edit "$(jq -r \'.tool_input.file_path\')"',
+                timeout: 3000,
+            }],
         });
     }
 
     // PostToolUse
     if (!config.hooks.PostToolUse) config.hooks.PostToolUse = [];
-    if (!config.hooks.PostToolUse.some((h: any) => h.command?.includes('claude-ex'))) {
+    if (!hasClaudeEx(config.hooks.PostToolUse)) {
         config.hooks.PostToolUse.push({
-            matcher: 'Write|Edit|MultiEdit',
-            command: 'claude-ex post-edit "$(cat /dev/stdin | jq -r \'.tool_input.file_path\')"',
-            timeout: 5000,
+            matcher: { tools: ['Write', 'Edit', 'MultiEdit'] },
+            hooks: [{
+                type: 'command',
+                command: 'claude-ex post-edit "$(jq -r \'.tool_input.file_path\')"',
+                timeout: 5000,
+            }],
         });
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "claude-ex",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Local code intelligence layer for Claude Code — indexes codebases into a SQLite graph database with symbols, dependency edges, and PageRank",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,7 +21,14 @@
     "type": "git",
     "url": "git+https://github.com/vihaanshahh/claude-ex.git"
   },
-  "keywords": ["claude", "code-intelligence", "mcp", "tree-sitter", "sqlite", "claude-code"],
+  "keywords": [
+    "claude",
+    "code-intelligence",
+    "mcp",
+    "tree-sitter",
+    "sqlite",
+    "claude-code"
+  ],
   "author": "vihaanshahh",
   "license": "MIT",
   "dependencies": {
