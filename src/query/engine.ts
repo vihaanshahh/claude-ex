@@ -270,6 +270,117 @@ export function getModules(db: Database.Database): ModuleResult[] {
     return results.sort((a, b) => b.symbolCount - a.symbolCount);
 }
 
+export interface FileResult {
+    path: string;
+    language: string | null;
+    lineCount: number;
+}
+
+export function findFiles(db: Database.Database, pattern: string, limit: number = 50): FileResult[] {
+    // Convert glob-like pattern to SQL GLOB pattern
+    // SQL GLOB uses * for any chars and ? for single char (same as shell glob)
+    // But we want ** to match path separators too, which GLOB * already does
+    const sqlPattern = pattern
+        .replace(/\*\*/g, '*')  // ** -> * (SQL GLOB * matches everything including /)
+        .replace(/\.\*/g, '.*'); // preserve .* as literal
+
+    const stmt = db.prepare(`
+        SELECT path, language, line_count as lineCount
+        FROM files
+        WHERE path GLOB ?
+        ORDER BY path
+        LIMIT ?
+    `);
+    return stmt.all(sqlPattern, limit) as FileResult[];
+}
+
+export interface FileMapEntry {
+    path: string;
+    language: string | null;
+    lineCount: number;
+    exports: string[];  // exported symbol names with kinds
+}
+
+/** Directories to exclude from file map (dependencies, build output) */
+const FILE_MAP_SKIP = new Set(['node_modules', 'dist', 'build', 'out', '.next', '.nuxt', 'vendor', 'target', 'coverage']);
+
+function isProjectFile(filePath: string): boolean {
+    const firstDir = filePath.split('/')[0];
+    return !FILE_MAP_SKIP.has(firstDir);
+}
+
+/** Returns a map of every project file → what it exports. This is the "memory" of the project. */
+export function getFileMap(db: Database.Database): FileMapEntry[] {
+    const files = db.prepare(`
+        SELECT f.id, f.path, f.language, f.line_count as lineCount
+        FROM files f
+        ORDER BY f.path
+    `).all() as { id: number; path: string; language: string | null; lineCount: number }[];
+
+    const exportStmt = db.prepare(`
+        SELECT name, kind, signature FROM symbols
+        WHERE file_id = ? AND exported = 1
+        ORDER BY line_start
+    `);
+
+    const results: FileMapEntry[] = [];
+    for (const f of files) {
+        if (!isProjectFile(f.path)) continue;
+        const exports = exportStmt.all(f.id) as { name: string; kind: string; signature: string | null }[];
+        results.push({
+            path: f.path,
+            language: f.language,
+            lineCount: f.lineCount,
+            exports: exports.map(e => `${e.name} [${e.kind}]`),
+        });
+    }
+    return results;
+}
+
+/** Compact file map string for embedding in CLAUDE.md / brief */
+export function getFileMapCompact(db: Database.Database, maxFiles: number = 80): string {
+    const files = db.prepare(`
+        SELECT f.id, f.path, f.language, f.line_count as lineCount
+        FROM files f
+        ORDER BY f.path
+    `).all() as { id: number; path: string; language: string | null; lineCount: number }[];
+
+    const projectFiles = files.filter(f => isProjectFile(f.path));
+
+    const exportStmt = db.prepare(`
+        SELECT name, kind FROM symbols
+        WHERE file_id = ? AND exported = 1
+        ORDER BY COALESCE((SELECT pagerank FROM rankings WHERE symbol_id = symbols.id), 0) DESC
+        LIMIT 8
+    `);
+
+    const allExportStmt = db.prepare(`
+        SELECT COUNT(*) as cnt FROM symbols WHERE file_id = ? AND exported = 1
+    `);
+
+    const lines: string[] = [];
+    const shown = projectFiles.slice(0, maxFiles);
+
+    for (const f of shown) {
+        const exports = exportStmt.all(f.id) as { name: string; kind: string }[];
+        const totalExports = (allExportStmt.get(f.id) as { cnt: number }).cnt;
+
+        if (exports.length === 0) {
+            lines.push(`- \`${f.path}\``);
+        } else {
+            const names = exports.map(e => e.name);
+            const suffix = totalExports > names.length ? ` +${totalExports - names.length} more` : '';
+            lines.push(`- \`${f.path}\` — ${names.join(', ')}${suffix}`);
+        }
+    }
+
+    if (projectFiles.length > maxFiles) {
+        lines.push(`- ... and ${projectFiles.length - maxFiles} more files`);
+    }
+
+    return lines.join('\n');
+}
+
 export function getStats(db: Database.Database): Stats {
     const files = (db.prepare('SELECT COUNT(*) as cnt FROM files').get() as any).cnt;
     const symbols = (db.prepare('SELECT COUNT(*) as cnt FROM symbols').get() as any).cnt;
@@ -307,8 +418,16 @@ export function brief(db: Database.Database): string {
         }
     }
 
+    // Compact file map — so Claude knows where everything is
+    const fileMap = getFileMapCompact(db, 40);
+    if (fileMap) {
+        lines.push('');
+        lines.push('File map (file → exports):');
+        lines.push(fileMap);
+    }
+
     lines.push('');
-    lines.push('Use MCP tools (search_code, get_callers, get_dependents, get_symbol) for structural queries.');
+    lines.push('Use MCP tools (search_code, find_files, get_file_map, get_callers, get_dependents, get_symbol) for structural queries.');
     return lines.join('\n');
 }
 
@@ -360,6 +479,117 @@ export function preEditContext(db: Database.Database, filePath: string): string 
     }
 
     return lines.length > 0 ? lines.join('\n') : `File ${filePath} indexed but has no tracked exports/imports.`;
+}
+
+// --- New query functions ---
+
+export interface FileSymbolResult {
+    name: string;
+    qualifiedName: string | null;
+    kind: string;
+    lineStart: number;
+    lineEnd: number;
+    signature: string | null;
+    exported: boolean;
+    parameters: string | null;
+}
+
+/** Get all symbols in a specific file */
+export function getFileSymbols(db: Database.Database, filePath: string): FileSymbolResult[] {
+    const stmt = db.prepare(`
+        SELECT s.name, s.qualified_name as qualifiedName, s.kind, s.line_start as lineStart,
+               s.line_end as lineEnd, s.signature, s.exported, s.parameters
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE f.path = ?
+        ORDER BY s.line_start
+    `);
+    return stmt.all(filePath) as FileSymbolResult[];
+}
+
+/** Find symbols by kind (class, function, interface, type, enum, method, variable) */
+export function findByKind(db: Database.Database, kind: string, limit: number = 50): SearchResult[] {
+    const stmt = db.prepare(`
+        SELECT s.name, s.qualified_name, s.kind, f.path as file,
+               s.line_start, s.line_end, s.signature,
+               COALESCE(r.pagerank, 0) as pagerank
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        LEFT JOIN rankings r ON r.symbol_id = s.id
+        WHERE s.kind = ?
+        ORDER BY r.pagerank DESC
+        LIMIT ?
+    `);
+    return stmt.all(kind, limit) as SearchResult[];
+}
+
+export interface TypeHierarchyResult {
+    name: string;
+    qualifiedName: string | null;
+    kind: string;
+    file: string;
+    lineStart: number;
+    relationKind: string;  // 'extends' or 'implements'
+}
+
+/** Find all classes/interfaces that extend or implement a given name */
+export function getTypeHierarchy(db: Database.Database, parentName: string): TypeHierarchyResult[] {
+    const stmt = db.prepare(`
+        SELECT s.name, s.qualified_name as qualifiedName, s.kind, f.path as file,
+               s.line_start as lineStart, tr.kind as relationKind
+        FROM type_relations tr
+        JOIN symbols s ON s.id = tr.child_id
+        JOIN files f ON f.id = s.file_id
+        WHERE tr.parent_name = ?
+        ORDER BY tr.kind, s.name
+    `);
+    return stmt.all(parentName) as TypeHierarchyResult[];
+}
+
+export interface DeadExportResult {
+    name: string;
+    kind: string;
+    file: string;
+    lineStart: number;
+}
+
+/** Find exported symbols that nothing references or imports */
+export function findDeadExports(db: Database.Database, limit: number = 50): DeadExportResult[] {
+    const stmt = db.prepare(`
+        SELECT s.name, s.kind, f.path as file, s.line_start as lineStart
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE s.exported = 1
+          AND s.kind != 'reexport'
+          AND NOT EXISTS (
+              SELECT 1 FROM edges e WHERE e.to_id = s.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM file_deps fd
+              WHERE fd.to_file = s.file_id
+                AND (fd.import_name LIKE '%' || s.name || '%' OR fd.import_name = '*')
+          )
+        ORDER BY f.path, s.line_start
+        LIMIT ?
+    `);
+    return stmt.all(limit) as DeadExportResult[];
+}
+
+export interface PkgUsageResult {
+    file: string;
+    importedNames: string;
+}
+
+/** Find all files that import from a given package */
+export function getPkgUsages(db: Database.Database, packageName: string): PkgUsageResult[] {
+    const stmt = db.prepare(`
+        SELECT f.path as file, pd.imported_names as importedNames
+        FROM pkg_deps pd
+        JOIN files f ON f.id = pd.file_id
+        WHERE pd.package = ? OR pd.package LIKE ? || '/%'
+        ORDER BY f.path
+    `);
+    return stmt.all(packageName, packageName) as PkgUsageResult[];
 }
 
 // --- Convenience wrappers for CLI (open/close DB internally) ---

@@ -4,7 +4,7 @@ import * as path from 'path';
 const SKIP_DIRS = new Set([
     'node_modules', '.git', '.hg', '.svn', 'dist', 'build', 'out',
     '.next', '.nuxt', '__pycache__', '.pytest_cache', 'target', 'vendor',
-    '.codex', '.claude', 'coverage', '.vscode', '.idea', 'venv', '.venv',
+    '.codex', '.claude', '.local', 'coverage', '.vscode', '.idea', 'venv', '.venv',
     '.env', '.tox', 'bower_components', '.cache', '.parcel-cache',
     'tmp', 'temp', '.turbo', '.vercel', '.netlify',
 ]);

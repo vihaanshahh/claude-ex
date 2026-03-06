@@ -4,9 +4,10 @@ import * as child_process from 'child_process';
 import Database from 'better-sqlite3';
 import { reindexFile } from '../indexer';
 import { isSupportedFile } from '../indexer/parser';
+import { getCodexDir } from '../utils';
 
 const IGNORE_PATTERNS = [
-    '**/node_modules/**', '**/.git/**', '**/.codex/**', '**/dist/**',
+    '**/node_modules/**', '**/.git/**', '**/.codex/**', '**/.local/**', '**/dist/**',
     '**/build/**', '**/out/**', '**/.next/**', '**/.nuxt/**',
     '**/__pycache__/**', '**/target/**', '**/vendor/**', '**/coverage/**',
     '**/.cache/**', '**/tmp/**', '**/temp/**',
@@ -64,7 +65,7 @@ export async function startWatcher(
 }
 
 export function startDaemon(rootDir: string): void {
-    const pidFile = path.join(rootDir, '.codex', 'codex.pid');
+    const pidFile = path.join(getCodexDir(rootDir), 'codex.pid');
     const script = path.resolve(__dirname, '..', 'index.js');
 
     const child = child_process.spawn(process.execPath, [script, 'daemon-worker', rootDir], {
@@ -81,7 +82,7 @@ export function startDaemon(rootDir: string): void {
 }
 
 export function stopDaemon(rootDir: string): void {
-    const pidFile = path.join(rootDir, '.codex', 'codex.pid');
+    const pidFile = path.join(getCodexDir(rootDir), 'codex.pid');
     if (!fs.existsSync(pidFile)) {
         console.log('No daemon running.');
         return;
@@ -99,7 +100,7 @@ export function stopDaemon(rootDir: string): void {
 }
 
 export function isDaemonRunning(rootDir: string): boolean {
-    const pidFile = path.join(rootDir, '.codex', 'codex.pid');
+    const pidFile = path.join(getCodexDir(rootDir), 'codex.pid');
     if (!fs.existsSync(pidFile)) return false;
 
     const pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);

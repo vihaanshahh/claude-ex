@@ -4,6 +4,10 @@ import * as fs from 'fs';
 export function findProjectRoot(startDir?: string): string | null {
     let dir = startDir ? path.resolve(startDir) : process.cwd();
     while (true) {
+        // Check .local/.codex/ first (work mode), then .codex/
+        if (fs.existsSync(path.join(dir, '.local', '.codex', 'index.db'))) {
+            return dir;
+        }
         if (fs.existsSync(path.join(dir, '.codex', 'index.db'))) {
             return dir;
         }
@@ -13,8 +17,17 @@ export function findProjectRoot(startDir?: string): string | null {
     }
 }
 
-export function ensureCodexDir(rootDir: string): string {
-    const codexDir = path.join(rootDir, '.codex');
+/** Returns the .codex directory path, preferring .local/.codex if it exists */
+export function getCodexDir(rootDir: string): string {
+    const localDir = path.join(rootDir, '.local', '.codex');
+    if (fs.existsSync(localDir)) return localDir;
+    return path.join(rootDir, '.codex');
+}
+
+export function ensureCodexDir(rootDir: string, work?: boolean): string {
+    const codexDir = work
+        ? path.join(rootDir, '.local', '.codex')
+        : getCodexDir(rootDir); // Use existing location if already set up
     if (!fs.existsSync(codexDir)) {
         fs.mkdirSync(codexDir, { recursive: true });
     }

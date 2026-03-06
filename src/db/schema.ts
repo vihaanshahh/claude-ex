@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import * as path from 'path';
 import * as fs from 'fs';
-import { ensureCodexDir } from '../utils';
+import { ensureCodexDir, getCodexDir } from '../utils';
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS files (
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS edges (
     from_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
     to_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
+    line INTEGER,
     PRIMARY KEY (from_id, to_id, kind)
 );
 
@@ -42,6 +43,20 @@ CREATE TABLE IF NOT EXISTS file_deps (
     kind TEXT NOT NULL,
     import_name TEXT,
     PRIMARY KEY (from_file, to_file, kind, import_name)
+);
+
+CREATE TABLE IF NOT EXISTS pkg_deps (
+    file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+    package TEXT NOT NULL,
+    imported_names TEXT,
+    PRIMARY KEY (file_id, package)
+);
+
+CREATE TABLE IF NOT EXISTS type_relations (
+    child_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+    parent_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    PRIMARY KEY (child_id, parent_name, kind)
 );
 
 CREATE TABLE IF NOT EXISTS rankings (
@@ -84,11 +99,16 @@ CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_exported ON symbols(exported, file_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id, kind);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_file_deps_to ON file_deps(to_file);
 CREATE INDEX IF NOT EXISTS idx_file_deps_from ON file_deps(from_file);
+CREATE INDEX IF NOT EXISTS idx_pkg_deps_package ON pkg_deps(package);
+CREATE INDEX IF NOT EXISTS idx_pkg_deps_file ON pkg_deps(file_id);
+CREATE INDEX IF NOT EXISTS idx_type_relations_parent ON type_relations(parent_name);
+CREATE INDEX IF NOT EXISTS idx_type_relations_child ON type_relations(child_id);
 `;
 
 const PRAGMAS = [
@@ -100,8 +120,8 @@ const PRAGMAS = [
     'PRAGMA mmap_size = 268435456',
 ];
 
-export function openDatabase(projectRoot: string): Database.Database {
-    const codexDir = ensureCodexDir(projectRoot);
+export function openDatabase(projectRoot: string, work?: boolean): Database.Database {
+    const codexDir = work !== undefined ? ensureCodexDir(projectRoot, work) : ensureCodexDir(projectRoot);
     const dbPath = path.join(codexDir, 'index.db');
     const db = new Database(dbPath);
 
@@ -114,7 +134,21 @@ export function openDatabase(projectRoot: string): Database.Database {
     db.exec(TRIGGERS_SQL);
     db.exec(INDEXES_SQL);
 
+    // Migrations for existing databases
+    migrateSchema(db);
+
     return db;
+}
+
+function migrateSchema(db: Database.Database): void {
+    // Add columns that may not exist in older databases
+    const migrations = [
+        'ALTER TABLE symbols ADD COLUMN parameters TEXT',
+        'ALTER TABLE edges ADD COLUMN line INTEGER',
+    ];
+    for (const sql of migrations) {
+        try { db.exec(sql); } catch { /* column already exists */ }
+    }
 }
 
 export interface FileRecord {
@@ -144,7 +178,8 @@ export function getOrCreateFile(
     filePath: string,
     hash: string,
     language: string | null,
-    lineCount: number
+    lineCount: number,
+    lastModified?: number
 ): FileRecord {
     const get = getOrPrepare(
         getFileStmt, db,
@@ -158,25 +193,27 @@ export function getOrCreateFile(
         }
         const update = getOrPrepare(
             updateFileStmt, db,
-            'UPDATE files SET content_hash = ?, language = ?, line_count = ?, last_indexed = ? WHERE id = ?'
+            'UPDATE files SET content_hash = ?, language = ?, line_count = ?, last_modified = ?, last_indexed = ? WHERE id = ?'
         );
-        update.run(hash, language, lineCount, Date.now(), existing.id);
+        update.run(hash, language, lineCount, lastModified || Date.now(), Date.now(), existing.id);
         return { id: existing.id, changed: true };
     }
 
     const insert = getOrPrepare(
         insertFileStmt, db,
-        'INSERT INTO files (path, content_hash, language, line_count, last_indexed) VALUES (?, ?, ?, ?, ?)'
+        'INSERT INTO files (path, content_hash, language, line_count, last_modified, last_indexed) VALUES (?, ?, ?, ?, ?, ?)'
     );
-    const result = insert.run(filePath, hash, language, lineCount, Date.now());
+    const result = insert.run(filePath, hash, language, lineCount, lastModified || Date.now(), Date.now());
     return { id: Number(result.lastInsertRowid), changed: true };
 }
 
 export function clearFileData(db: Database.Database, fileId: number): void {
     db.prepare('DELETE FROM rankings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)').run(fileId);
+    db.prepare('DELETE FROM type_relations WHERE child_id IN (SELECT id FROM symbols WHERE file_id = ?)').run(fileId);
     db.prepare('DELETE FROM edges WHERE from_id IN (SELECT id FROM symbols WHERE file_id = ?) OR to_id IN (SELECT id FROM symbols WHERE file_id = ?)').run(fileId, fileId);
     db.prepare('DELETE FROM symbols WHERE file_id = ?').run(fileId);
     db.prepare('DELETE FROM file_deps WHERE from_file = ?').run(fileId);
+    db.prepare('DELETE FROM pkg_deps WHERE file_id = ?').run(fileId);
 }
 
 export interface SymbolData {
@@ -190,12 +227,13 @@ export interface SymbolData {
     content?: string;
     contentHash?: string;
     exported?: boolean;
+    parameters?: string;  // JSON array of {name, type} pairs
 }
 
 export function insertSymbol(db: Database.Database, fileId: number, sym: SymbolData): number {
     const stmt = db.prepare(
-        `INSERT INTO symbols (name, qualified_name, kind, file_id, line_start, line_end, signature, docstring, content, content_hash, exported)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO symbols (name, qualified_name, kind, file_id, line_start, line_end, signature, docstring, content, content_hash, exported, parameters)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const result = stmt.run(
         sym.name,
@@ -208,13 +246,22 @@ export function insertSymbol(db: Database.Database, fileId: number, sym: SymbolD
         sym.docstring || null,
         sym.content || null,
         sym.contentHash || null,
-        sym.exported ? 1 : 0
+        sym.exported ? 1 : 0,
+        sym.parameters || null
     );
     return Number(result.lastInsertRowid);
 }
 
-export function insertEdge(db: Database.Database, fromId: number, toId: number, kind: string): void {
-    db.prepare('INSERT OR IGNORE INTO edges (from_id, to_id, kind) VALUES (?, ?, ?)').run(fromId, toId, kind);
+export function insertEdge(db: Database.Database, fromId: number, toId: number, kind: string, line?: number): void {
+    db.prepare('INSERT OR IGNORE INTO edges (from_id, to_id, kind, line) VALUES (?, ?, ?, ?)').run(fromId, toId, kind, line || null);
+}
+
+export function insertPkgDep(db: Database.Database, fileId: number, packageName: string, importedNames: string): void {
+    db.prepare('INSERT OR IGNORE INTO pkg_deps (file_id, package, imported_names) VALUES (?, ?, ?)').run(fileId, packageName, importedNames);
+}
+
+export function insertTypeRelation(db: Database.Database, childId: number, parentName: string, kind: string): void {
+    db.prepare('INSERT OR IGNORE INTO type_relations (child_id, parent_name, kind) VALUES (?, ?, ?)').run(childId, parentName, kind);
 }
 
 export function insertFileDep(

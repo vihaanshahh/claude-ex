@@ -3,7 +3,8 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import {
     openDatabase, getOrCreateFile, clearFileData,
-    insertSymbol, insertEdge, insertFileDep, removeStaleFiles, removeFile
+    insertSymbol, insertEdge, insertFileDep, insertPkgDep, insertTypeRelation,
+    removeStaleFiles, removeFile
 } from '../db/schema';
 import { collectFiles } from './collector';
 import { parseFile, hashFile, getLanguage } from './parser';
@@ -43,9 +44,21 @@ function resolveImportPath(rootDir: string, fromFile: string, importSource: stri
     return null;
 }
 
-export function indexProject(rootDir: string, options?: { verbose?: boolean }): IndexStats {
+function isPackageImport(source: string): boolean {
+    return !source.startsWith('.') && !source.startsWith('/');
+}
+
+function getFileMtime(fullPath: string): number | undefined {
+    try {
+        return fs.statSync(fullPath).mtimeMs;
+    } catch {
+        return undefined;
+    }
+}
+
+export function indexProject(rootDir: string, options?: { verbose?: boolean; work?: boolean }): IndexStats {
     const start = performance.now();
-    const db = openDatabase(rootDir);
+    const db = openDatabase(rootDir, options?.work);
     const files = collectFiles(rootDir);
     const verbose = options?.verbose ?? false;
 
@@ -73,7 +86,8 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean }): 
             const hash = hashFile(content);
             const language = getLanguage(relPath);
             const lineCount = content.split('\n').length;
-            const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount);
+            const mtime = getFileMtime(fullPath);
+            const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount, mtime);
 
             if (!fileRecord.changed) {
                 skippedFiles++;
@@ -108,17 +122,55 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean }): 
                     docstring: sym.docstring,
                     content: sym.content,
                     exported: sym.exported,
+                    parameters: sym.parameters ? JSON.stringify(sym.parameters) : undefined,
                 });
                 symbolMap.set(sym.name, symId);
                 if (sym.qualifiedName) symbolMap.set(sym.qualifiedName, symId);
                 totalSymbols++;
+
+                // Store type relations (extends/implements)
+                if (sym.extends) {
+                    for (const parent of sym.extends) {
+                        insertTypeRelation(db, symId, parent, 'extends');
+                    }
+                }
+                if (sym.implements) {
+                    for (const iface of sym.implements) {
+                        insertTypeRelation(db, symId, iface, 'implements');
+                    }
+                }
             }
 
             fileSymbolMap.set(relPath, symbolMap);
 
+            // Create re-export pseudo-symbols so barrel files show their exports
+            for (const reExport of parsed.reExports) {
+                for (const name of reExport.names) {
+                    if (!symbolMap.has(name)) {
+                        const symId = insertSymbol(db, fileRecord.id, {
+                            name,
+                            kind: 'reexport',
+                            lineStart: 0,
+                            lineEnd: 0,
+                            signature: `export { ${name} } from '${reExport.source}'`,
+                            exported: true,
+                        });
+                        symbolMap.set(name, symId);
+                        totalSymbols++;
+                    }
+                }
+            }
+
             // Resolve imports to file paths
             const resolvedImports: { resolved: string; names: string[] }[] = [];
             for (const imp of parsed.imports) {
+                if (isPackageImport(imp.source)) {
+                    // Third-party import — store in pkg_deps
+                    const names = imp.names.length > 0 ? imp.names.join(',') : imp.isDefault ? 'default' : '*';
+                    insertPkgDep(db, fileRecord.id, imp.source, names);
+                    continue;
+                }
+
                 const resolved = resolveImportPath(rootDir, relPath, imp.source);
                 if (resolved) {
                     // Create file dep
@@ -132,12 +184,12 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean }): 
             }
             fileImportMap.set(relPath, resolvedImports);
 
-            // Create intra-file call edges
+            // Create intra-file call edges (with line numbers)
             for (const call of parsed.calls) {
                 const callerId = symbolMap.get(call.callerSymbol);
                 const calledId = symbolMap.get(call.calledName);
                 if (callerId && calledId && callerId !== calledId) {
-                    insertEdge(db, callerId, calledId, 'calls');
+                    insertEdge(db, callerId, calledId, 'calls', call.line);
                     totalEdges++;
                 }
             }
@@ -216,7 +268,8 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
     const hash = hashFile(content);
     const language = getLanguage(relPath);
     const lineCount = content.split('\n').length;
-    const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount);
+    const mtime = getFileMtime(fullPath);
+    const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount, mtime);
 
     if (!fileRecord.changed) {
         if (shouldClose) db.close();
@@ -238,13 +291,49 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
             docstring: sym.docstring,
             content: sym.content,
             exported: sym.exported,
+            parameters: sym.parameters ? JSON.stringify(sym.parameters) : undefined,
         });
         symbolMap.set(sym.name, symId);
         if (sym.qualifiedName) symbolMap.set(sym.qualifiedName, symId);
+
+        // Store type relations
+        if (sym.extends) {
+            for (const parent of sym.extends) {
+                insertTypeRelation(db, symId, parent, 'extends');
+            }
+        }
+        if (sym.implements) {
+            for (const iface of sym.implements) {
+                insertTypeRelation(db, symId, iface, 'implements');
+            }
+        }
+    }
+
+    // Re-export pseudo-symbols
+    for (const reExport of parsed.reExports) {
+        for (const name of reExport.names) {
+            if (!symbolMap.has(name)) {
+                const symId = insertSymbol(db, fileRecord.id, {
+                    name,
+                    kind: 'reexport',
+                    lineStart: 0,
+                    lineEnd: 0,
+                    signature: `export { ${name} } from '${reExport.source}'`,
+                    exported: true,
+                });
+                symbolMap.set(name, symId);
+            }
+        }
     }
 
     // Resolve imports
     for (const imp of parsed.imports) {
+        if (isPackageImport(imp.source)) {
+            const names = imp.names.length > 0 ? imp.names.join(',') : imp.isDefault ? 'default' : '*';
+            insertPkgDep(db, fileRecord.id, imp.source, names);
+            continue;
+        }
+
         const resolved = resolveImportPath(rootDir, relPath, imp.source);
         if (resolved) {
             const toFile = db.prepare('SELECT id FROM files WHERE path = ?').get(resolved) as { id: number } | undefined;
@@ -254,12 +343,12 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
         }
     }
 
-    // Intra-file call edges
+    // Intra-file call edges (with line numbers)
     for (const call of parsed.calls) {
         const callerId = symbolMap.get(call.callerSymbol);
         const calledId = symbolMap.get(call.calledName);
         if (callerId && calledId && callerId !== calledId) {
-            insertEdge(db, callerId, calledId, 'calls');
+            insertEdge(db, callerId, calledId, 'calls', call.line);
         }
     }
 

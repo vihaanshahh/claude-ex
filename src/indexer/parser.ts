@@ -72,6 +72,11 @@ export function hashFile(content: string): string {
     return crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
 }
 
+export interface ExtractedParam {
+    name: string;
+    type?: string;
+}
+
 export interface ExtractedSymbol {
     name: string;
     qualifiedName?: string;
@@ -82,6 +87,9 @@ export interface ExtractedSymbol {
     docstring?: string;
     content?: string;
     exported?: boolean;
+    parameters?: ExtractedParam[];
+    extends?: string[];       // class/interface extends
+    implements?: string[];    // class implements
 }
 
 export interface ExtractedImport {
@@ -96,10 +104,16 @@ export interface ExtractedCall {
     line: number;
 }
 
+export interface ExtractedReExport {
+    source: string;
+    names: string[];    // re-exported names (empty = export *)
+}
+
 export interface ParseResult {
     symbols: ExtractedSymbol[];
     imports: ExtractedImport[];
     calls: ExtractedCall[];
+    reExports: ExtractedReExport[];
     language: string | null;
 }
 
@@ -107,27 +121,28 @@ const SKIP_CALLS = new Set(['console.log', 'console.error', 'console.warn', 'con
 
 export function parseFile(filePath: string, content: string): ParseResult {
     const language = getLanguage(filePath);
-    if (!language) return { symbols: [], imports: [], calls: [], language: null };
+    if (!language) return { symbols: [], imports: [], calls: [], reExports: [], language: null };
 
     // Skip parsing for JSON/CSS/HTML — no meaningful symbols
     if (['json', 'css', 'html'].includes(language)) {
-        return { symbols: [], imports: [], calls: [], language };
+        return { symbols: [], imports: [], calls: [], reExports: [], language };
     }
 
     const parser = getParser(language);
-    if (!parser) return { symbols: [], imports: [], calls: [], language };
+    if (!parser) return { symbols: [], imports: [], calls: [], reExports: [], language };
 
     let tree: any;
     try {
         tree = parser.parse(content);
     } catch {
-        return { symbols: [], imports: [], calls: [], language };
+        return { symbols: [], imports: [], calls: [], reExports: [], language };
     }
 
     const lines = content.split('\n');
     const symbols: ExtractedSymbol[] = [];
     const imports: ExtractedImport[] = [];
     const calls: ExtractedCall[] = [];
+    const reExports: ExtractedReExport[] = [];
 
     function getDocstring(node: any): string | undefined {
         const prev = node.previousNamedSibling;
@@ -183,6 +198,87 @@ export function parseFile(filePath: string, content: string): ParseResult {
         return null;
     }
 
+    function extractParameters(node: any): ExtractedParam[] | undefined {
+        const params = node.childForFieldName('parameters') ||
+            node.children?.find((c: any) => c.type === 'formal_parameters' || c.type === 'parameters');
+        if (!params) return undefined;
+
+        const result: ExtractedParam[] = [];
+        for (let i = 0; i < params.namedChildCount; i++) {
+            const param = params.namedChild(i);
+            if (!param) continue;
+            // TS/JS: required_parameter, optional_parameter, rest_parameter
+            // Python: identifier, default_parameter, typed_parameter
+            const nameNode = param.childForFieldName('name') || param.childForFieldName('pattern') ||
+                (param.type === 'identifier' ? param : null);
+            if (!nameNode) continue;
+
+            const typeNode = param.childForFieldName('type');
+            result.push({
+                name: nameNode.text,
+                type: typeNode ? typeNode.text.slice(0, 100) : undefined,
+            });
+        }
+        return result.length > 0 ? result : undefined;
+    }
+
+    function extractClassHeritage(node: any): { extends_: string[]; implements_: string[] } {
+        const extends_: string[] = [];
+        const implements_: string[] = [];
+
+        for (let i = 0; i < node.childCount; i++) {
+            const child = node.child(i);
+            if (!child) continue;
+
+            // TS/JS class_heritage, extends_clause, implements_clause
+            if (child.type === 'class_heritage') {
+                for (let j = 0; j < child.childCount; j++) {
+                    const clause = child.child(j);
+                    if (!clause) continue;
+                    if (clause.type === 'extends_clause') {
+                        for (let k = 0; k < clause.namedChildCount; k++) {
+                            const t = clause.namedChild(k);
+                            if (t) extends_.push(t.text.split('<')[0].trim()); // strip generics
+                        }
+                    } else if (clause.type === 'implements_clause') {
+                        for (let k = 0; k < clause.namedChildCount; k++) {
+                            const t = clause.namedChild(k);
+                            if (t) implements_.push(t.text.split('<')[0].trim());
+                        }
+                    }
+                }
+            }
+            // Direct extends_clause / implements_clause (varies by grammar)
+            if (child.type === 'extends_clause') {
+                for (let k = 0; k < child.namedChildCount; k++) {
+                    const t = child.namedChild(k);
+                    if (t) extends_.push(t.text.split('<')[0].trim());
+                }
+            } else if (child.type === 'implements_clause') {
+                for (let k = 0; k < child.namedChildCount; k++) {
+                    const t = child.namedChild(k);
+                    if (t) implements_.push(t.text.split('<')[0].trim());
+                }
+            }
+            // Python: argument_list for class bases
+            if (child.type === 'argument_list' && node.type === 'class_definition') {
+                for (let k = 0; k < child.namedChildCount; k++) {
+                    const base = child.namedChild(k);
+                    if (base) extends_.push(base.text.split('(')[0].trim());
+                }
+            }
+            // Interface extends
+            if (child.type === 'extends_type_clause') {
+                for (let k = 0; k < child.namedChildCount; k++) {
+                    const t = child.namedChild(k);
+                    if (t) extends_.push(t.text.split('<')[0].trim());
+                }
+            }
+        }
+
+        return { extends_, implements_ };
+    }
+
     function walkNode(node: any, className?: string) {
         const type = node.type;
 
@@ -200,6 +296,7 @@ export function parseFile(filePath: string, content: string): ParseResult {
                     docstring: getDocstring(node),
                     content: getContent(node, 2048),
                     exported: isExported(node),
+                    parameters: extractParameters(node),
                 });
             }
         } else if (type === 'method_definition') {
@@ -215,12 +312,14 @@ export function parseFile(filePath: string, content: string): ParseResult {
                     docstring: getDocstring(node),
                     content: getContent(node, 2048),
                     exported: isExported(node),
+                    parameters: extractParameters(node),
                 });
             }
         } else if (['class_declaration', 'class_definition'].includes(type)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
                 const name = nameNode.text;
+                const heritage = extractClassHeritage(node);
                 symbols.push({
                     name,
                     kind: 'class',
@@ -230,6 +329,8 @@ export function parseFile(filePath: string, content: string): ParseResult {
                     docstring: getDocstring(node),
                     content: getContent(node, 3072),
                     exported: isExported(node),
+                    extends: heritage.extends_.length > 0 ? heritage.extends_ : undefined,
+                    implements: heritage.implements_.length > 0 ? heritage.implements_ : undefined,
                 });
                 // Walk children with class context
                 for (let i = 0; i < node.childCount; i++) {
@@ -240,6 +341,7 @@ export function parseFile(filePath: string, content: string): ParseResult {
         } else if (type === 'interface_declaration') {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
+                const heritage = extractClassHeritage(node);
                 symbols.push({
                     name: nameNode.text,
                     kind: 'interface',
@@ -249,6 +351,7 @@ export function parseFile(filePath: string, content: string): ParseResult {
                     docstring: getDocstring(node),
                     content: getContent(node, 3072),
                     exported: isExported(node),
+                    extends: heritage.extends_.length > 0 ? heritage.extends_ : undefined,
                 });
             }
         } else if (type === 'type_alias_declaration') {
@@ -296,6 +399,7 @@ export function parseFile(filePath: string, content: string): ParseResult {
                                     docstring: getDocstring(node),
                                     content: getContent(node, 2048),
                                     exported: true,
+                                    parameters: extractParameters(value),
                                 });
                             } else {
                                 symbols.push({
@@ -311,6 +415,32 @@ export function parseFile(filePath: string, content: string): ParseResult {
                         }
                     }
                 }
+            }
+        }
+
+        // Re-exports: export { foo } from './bar' and export * from './bar'
+        if (type === 'export_statement') {
+            const sourceNode = node.childForFieldName('source') ||
+                node.children?.find((c: any) => c.type === 'string' || c.type === 'string_literal');
+            if (sourceNode) {
+                const source = sourceNode.text.replace(/['"]/g, '');
+                const names: string[] = [];
+                // Collect re-exported names
+                for (let i = 0; i < node.childCount; i++) {
+                    const child = node.child(i);
+                    if (child && (child.type === 'export_clause' || child.type === 'named_exports')) {
+                        for (let j = 0; j < child.namedChildCount; j++) {
+                            const spec = child.namedChild(j);
+                            if (spec && spec.type === 'export_specifier') {
+                                const nameNode = spec.childForFieldName('name');
+                                if (nameNode) names.push(nameNode.text);
+                            }
+                        }
+                    }
+                }
+                reExports.push({ source, names });
+                // Also treat as an import for file dep resolution
+                imports.push({ source, names, isDefault: false });
             }
         }
 
@@ -405,5 +535,5 @@ export function parseFile(filePath: string, content: string): ParseResult {
 
     walkNode(tree.rootNode);
 
-    return { symbols, imports, calls, language };
+    return { symbols, imports, calls, reExports, language };
 }

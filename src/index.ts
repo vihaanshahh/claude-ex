@@ -44,26 +44,35 @@ program
     .command('init')
     .argument('[path]', 'Project directory')
     .option('-v, --verbose', 'Verbose output')
+    .option('-w, --work', 'Work mode: store data in .local/ and gitignore all config (nothing committed)')
     .description('Index project + install Claude Code config + generate docs')
     .action((pathArg, opts) => {
         const rootDir = resolveRoot(pathArg);
         const dirname = path.basename(rootDir);
+        const work = !!opts.work;
 
-        console.log(`Indexing ${dirname}...`);
-        const stats = indexProject(rootDir, { verbose: opts.verbose });
+        console.log(`Indexing ${dirname}...${work ? ' (work mode — .local/)' : ''}`);
+        const stats = indexProject(rootDir, { verbose: opts.verbose, work });
 
         console.log(`Indexed ${stats.indexedFiles} files (${stats.skippedFiles} unchanged) in ${formatMs(stats.timeMs)}`);
         console.log(`  ${stats.symbols} symbols, ${stats.edges} edges`);
 
         console.log('Installing Claude Code config...');
-        install(rootDir);
+        install(rootDir, { work });
 
-        console.log('Generating CLAUDE.md...');
-        writeClaudeMd(rootDir);
+        if (!work) {
+            console.log('Generating CLAUDE.md...');
+            writeClaudeMd(rootDir);
+        } else {
+            console.log('Skipping CLAUDE.md (work mode — use codex MCP tools instead)');
+        }
 
         console.log('');
         console.log('Setup complete! MCP server will start automatically when you open Claude Code.');
         console.log('Hooks installed: SessionStart, PreToolUse (Write/Edit), PostToolUse (Write/Edit)');
+        if (work) {
+            console.log('Work mode: .local/, .claude/, .mcp.json are gitignored — nothing committed.');
+        }
     });
 
 // --- reindex ---
@@ -268,6 +277,7 @@ program
 
         const toRemove = [
             path.join(rootDir, '.codex'),
+            path.join(rootDir, '.local', '.codex'),
             path.join(rootDir, '.claude', 'skills', 'codex'),
         ];
 

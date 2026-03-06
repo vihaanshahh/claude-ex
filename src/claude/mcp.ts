@@ -9,7 +9,8 @@ import { findProjectRoot } from '../utils';
 import { startWatcher } from '../watcher/daemon';
 import {
     search, getCallers, getContext, getImpact,
-    getDeps, getRank, getModules, getStats,
+    getDeps, getRank, getModules, getStats, findFiles, getFileMap,
+    getFileSymbols, findByKind, getTypeHierarchy, findDeadExports, getPkgUsages,
 } from '../query/engine';
 import { reindexFile } from '../indexer';
 
@@ -114,6 +115,81 @@ export async function runMcpServer(): Promise<void> {
                 },
             },
             {
+                name: 'get_file_map',
+                description: 'Get a map of every file in the project with its exported symbols. Use to understand where things live without searching. Returns file paths with their key exports.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {},
+                },
+            },
+            {
+                name: 'find_files',
+                description: 'Find files by path pattern using glob syntax (e.g. "**/*.test.ts", "src/components/*", "*.json"). Faster than shell find/ls commands. Searches indexed files only.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        pattern: { type: 'string', description: 'Glob pattern to match file paths (e.g. "**/*.ts", "src/**/*.test.*", "*.json")' },
+                        limit: { type: 'number', description: 'Max results (default 50)' },
+                    },
+                    required: ['pattern'],
+                },
+            },
+            {
+                name: 'get_file_symbols',
+                description: 'Get all symbols (functions, classes, variables, etc.) in a specific file. Shows every definition with its kind, line range, signature, and parameters.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        file: { type: 'string', description: 'File path relative to project root' },
+                    },
+                    required: ['file'],
+                },
+            },
+            {
+                name: 'find_by_kind',
+                description: 'Find all symbols of a specific kind (class, function, interface, type, enum, method, variable). Ranked by structural importance.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        kind: { type: 'string', description: 'Symbol kind: class, function, interface, type, enum, method, variable, reexport' },
+                        limit: { type: 'number', description: 'Max results (default 50)' },
+                    },
+                    required: ['kind'],
+                },
+            },
+            {
+                name: 'get_type_hierarchy',
+                description: 'Find all classes that extend or implement a given class/interface. Use before changing a base class or interface to find all affected subclasses/implementors.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        name: { type: 'string', description: 'Class or interface name to find subclasses/implementors of' },
+                    },
+                    required: ['name'],
+                },
+            },
+            {
+                name: 'find_dead_exports',
+                description: 'Find exported symbols that nothing imports or references. Useful for dead code detection and cleanup.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        limit: { type: 'number', description: 'Max results (default 50)' },
+                    },
+                },
+            },
+            {
+                name: 'get_pkg_usages',
+                description: 'Find all files that import from a given npm/pip/cargo package. Use before swapping a library to find every usage point. Example: "react", "lodash", "express".',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        package: { type: 'string', description: 'Package name (e.g., "react", "lodash", "express")' },
+                    },
+                    required: ['package'],
+                },
+            },
+            {
                 name: 'reindex_file',
                 description: 'Re-index a single file immediately.',
                 inputSchema: {
@@ -160,6 +236,27 @@ export async function runMcpServer(): Promise<void> {
                         topSymbols: getRank(db, (args as any)?.top || 20),
                         modules: getModules(db),
                     };
+                    break;
+                case 'get_file_map':
+                    result = getFileMap(db);
+                    break;
+                case 'find_files':
+                    result = findFiles(db, (args as any).pattern, (args as any).limit);
+                    break;
+                case 'get_file_symbols':
+                    result = getFileSymbols(db, (args as any).file);
+                    break;
+                case 'find_by_kind':
+                    result = findByKind(db, (args as any).kind, (args as any).limit);
+                    break;
+                case 'get_type_hierarchy':
+                    result = getTypeHierarchy(db, (args as any).name);
+                    break;
+                case 'find_dead_exports':
+                    result = findDeadExports(db, (args as any)?.limit);
+                    break;
+                case 'get_pkg_usages':
+                    result = getPkgUsages(db, (args as any).package);
                     break;
                 case 'reindex_file': {
                     const fileStart = performance.now();
