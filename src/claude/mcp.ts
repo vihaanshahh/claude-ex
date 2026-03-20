@@ -11,6 +11,7 @@ import {
     search, getCallers, getContext, getImpact,
     getDeps, getRank, getModules, getStats, findFiles, getFileMap,
     getFileSymbols, findByKind, getTypeHierarchy, findDeadExports, getPkgUsages,
+    reviewDiff,
 } from '../query/engine';
 import { reindexFile } from '../indexer';
 
@@ -200,6 +201,16 @@ export async function runMcpServer(): Promise<void> {
                     required: ['file'],
                 },
             },
+            {
+                name: 'review_diff',
+                description: 'Gather graph-aware review context for a git diff. Parses the diff, maps changed lines to symbols, finds callers/dependents of changed code, computes cross-file impact, and flags risks. Returns structured context for writing a codebase-aware code review.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        target: { type: 'string', description: 'What to review: "last_commit" (default), "staged", "branch" (diff vs main/master), or a commit SHA' },
+                    },
+                },
+            },
         ],
     }));
 
@@ -264,6 +275,9 @@ export async function runMcpServer(): Promise<void> {
                     result = { success: true, timeMs: +(performance.now() - fileStart).toFixed(1) };
                     break;
                 }
+                case 'review_diff':
+                    result = reviewDiff(db, rootDir, (args as any)?.target || 'last_commit');
+                    break;
                 default:
                     return {
                         content: [{ type: 'text' as const, text: `Unknown tool: ${name}` }],

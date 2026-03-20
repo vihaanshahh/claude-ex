@@ -79,6 +79,13 @@ before swapping a library to find every usage point.
 ### reindex_file
 Re-index a single file immediately after making major changes.
 
+### review_diff
+Gather graph-aware context for reviewing a git diff. Analyzes changed symbols,
+their callers and dependents, cross-file impact, and risk assessment. Use when
+reviewing commits, staged changes, or branch diffs. Returns structured context
+so you can write an informed code review. Targets: "last_commit", "staged",
+"branch", or a commit SHA.
+
 ## When to prefer MCP tools over grep
 - "What calls processPayment?" → get_callers (not grep — grep misses indirect references)
 - "What breaks if I change auth.ts?" → get_dependents (not grep — grep can't trace transitive deps)
@@ -93,10 +100,63 @@ Re-index a single file immediately after making major changes.
 - "What extends BaseService?" → get_type_hierarchy
 - "Any dead exports?" → find_dead_exports
 - "What uses lodash?" → get_pkg_usages with "lodash"
+- "Review this commit" → review_diff with "last_commit"
+- "Review my staged changes" → review_diff with "staged"
+- "Review this branch/PR" → review_diff with "branch"
 
 ## When to use grep instead
 - Simple string search: "find all TODOs" → grep
 - Regex patterns: "find all console.log" → grep
+`;
+
+const REVIEW_SKILL_CONTENT = `---
+name: review
+description: >
+  Codebase-aware code review using the code graph. Reviews the last commit,
+  staged changes, or branch diff with full dependency and impact analysis.
+  Triggers: "review", "/review", "code review", "review this PR", "review changes"
+argument-hint: "[last_commit|staged|branch|<sha>]"
+allowed-tools: mcp__codex__review_diff, mcp__codex__get_symbol, mcp__codex__get_callers, mcp__codex__search_code
+---
+
+# Code Review
+
+Review the changes using the \`review_diff\` MCP tool with target "$ARGUMENTS" (default: "last_commit" if no argument provided).
+
+## Steps
+
+1. Call \`review_diff\` with the target to get graph-aware context (changed symbols, callers, impact, risks)
+2. Analyze the structured result carefully
+3. For any high-risk or complex changes, use \`get_symbol\` to read the full code of affected symbols
+4. Write a comprehensive review following the format below
+
+## Review Format
+
+### Summary
+- One-paragraph overview of what changed and why
+- Files changed, symbols modified, blast radius
+
+### Risk Assessment
+- Flag high-importance symbols that were modified (check pagerank)
+- Note exported symbols with many callers that could cascade
+- Warn about deleted files with dependents (broken imports)
+- Highlight large transitive impact
+
+### File-by-File Review
+For each changed file with symbols:
+- What symbols changed and their role in the codebase
+- Potential issues: bugs, logic errors, missing edge cases, type safety
+- Whether callers/dependents in other files need updating
+- Code quality: naming, patterns, consistency with codebase conventions
+
+### Cross-File Concerns
+- Dependencies that may break from these changes
+- Pattern inconsistencies across the codebase
+- Missing updates in dependent files listed in affectedDependents
+
+### Verdict
+- Overall assessment: approve, request changes, or needs discussion
+- Prioritized list of action items if any
 `;
 
 export function install(rootDir: string, options?: { work?: boolean }): void {
@@ -126,8 +186,9 @@ export function install(rootDir: string, options?: { work?: boolean }): void {
     // 3. Create/merge .claude/settings.json
     installHooks(rootDir);
 
-    // 4. Create skill file
+    // 4. Create skill files
     installSkill(rootDir);
+    installReviewSkill(rootDir);
 }
 
 function addToGitignore(rootDir: string, entry: string): void {
@@ -246,4 +307,10 @@ function installSkill(rootDir: string): void {
     const skillDir = path.join(rootDir, '.claude', 'skills', 'codex');
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(path.join(skillDir, 'SKILL.md'), SKILL_CONTENT);
+}
+
+function installReviewSkill(rootDir: string): void {
+    const skillDir = path.join(rootDir, '.claude', 'skills', 'review');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), REVIEW_SKILL_CONTENT);
 }

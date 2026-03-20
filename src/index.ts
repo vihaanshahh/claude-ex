@@ -8,7 +8,7 @@ import {
     searchFromRoot, getCallersFromRoot, getContextFromRoot,
     getImpactFromRoot, getDepsFromRoot, getRankFromRoot,
     getModulesFromRoot, getStatsFromRoot, briefFromRoot,
-    preEditContextFromRoot,
+    preEditContextFromRoot, reviewDiffFromRoot,
 } from './query/engine';
 import { install } from './claude/installer';
 import { writeClaudeMd } from './claude/claudemd';
@@ -214,6 +214,17 @@ program
         const rootDir = requireIndex();
         const relFile = path.isAbsolute(file) ? path.relative(rootDir, file) : file;
         reindexFile(rootDir, relFile);
+    });
+
+// --- review ---
+program
+    .command('review')
+    .argument('[target]', 'What to review: last_commit (default), staged, branch, or commit SHA')
+    .description('Get graph-aware diff review context')
+    .action((target) => {
+        const rootDir = requireIndex();
+        const result = reviewDiffFromRoot(rootDir, target || 'last_commit');
+        console.log(JSON.stringify(result, null, 2));
     });
 
 // --- generate-docs ---

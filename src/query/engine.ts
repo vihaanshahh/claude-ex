@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { execSync } from 'child_process';
 import { openDatabase } from '../db/schema';
 
 // Result types
@@ -592,6 +593,373 @@ export function getPkgUsages(db: Database.Database, packageName: string): PkgUsa
     return stmt.all(packageName, packageName) as PkgUsageResult[];
 }
 
+// --- review_diff types ---
+
+interface DiffHunk {
+    oldStart: number;
+    oldCount: number;
+    newStart: number;
+    newCount: number;
+}
+
+interface DiffFile {
+    path: string;
+    status: 'added' | 'modified' | 'deleted' | 'renamed';
+    oldPath?: string;
+    hunks: DiffHunk[];
+    addedLines: number;
+    deletedLines: number;
+}
+
+export interface ChangedSymbol {
+    name: string;
+    qualifiedName: string | null;
+    kind: string;
+    file: string;
+    lineStart: number;
+    lineEnd: number;
+    signature: string | null;
+    exported: boolean;
+    pagerank: number;
+    hunkOverlap: 'full' | 'partial';
+}
+
+export interface AffectedDependent {
+    symbolName: string;
+    symbolFile: string;
+    dependentName: string;
+    dependentFile: string;
+    dependentKind: string;
+    dependentPagerank: number;
+}
+
+export interface FileReviewContext {
+    path: string;
+    status: 'added' | 'modified' | 'deleted' | 'renamed';
+    oldPath?: string;
+    addedLines: number;
+    deletedLines: number;
+    changedSymbols: ChangedSymbol[];
+    unchangedExports: string[];
+}
+
+export interface ReviewDiffResult {
+    summary: {
+        target: string;
+        filesChanged: number;
+        filesAdded: number;
+        filesDeleted: number;
+        totalAdded: number;
+        totalDeleted: number;
+        symbolsModified: number;
+        highRiskSymbols: number;
+        impactedFiles: number;
+    };
+    diff: string;
+    files: FileReviewContext[];
+    affectedDependents: AffectedDependent[];
+    transitiveImpact: ImpactResult[];
+    risks: string[];
+}
+
+// --- review_diff helpers ---
+
+function getGitDiff(rootDir: string, target: string): string {
+    const opts = { cwd: rootDir, maxBuffer: 10 * 1024 * 1024, encoding: 'utf-8' as const };
+    try {
+        switch (target) {
+            case 'staged':
+                return execSync('git diff --cached', opts);
+            case 'last_commit':
+                return execSync('git diff HEAD~1 HEAD', opts);
+            case 'branch': {
+                let baseBranch = 'main';
+                try { execSync('git rev-parse --verify main', { ...opts, stdio: 'pipe' }); }
+                catch { baseBranch = 'master'; }
+                const mergeBase = execSync(`git merge-base ${baseBranch} HEAD`, opts).trim();
+                return execSync(`git diff ${mergeBase} HEAD`, opts);
+            }
+            default:
+                return execSync(`git diff ${target}~1 ${target}`, opts);
+        }
+    } catch (err: any) {
+        throw new Error(`git diff failed for target "${target}": ${err.message}`);
+    }
+}
+
+function parseDiff(rawDiff: string): DiffFile[] {
+    const files: DiffFile[] = [];
+    const fileSections = rawDiff.split(/^diff --git /m).filter(Boolean);
+
+    for (const section of fileSections) {
+        const lines = section.split('\n');
+        const headerMatch = lines[0].match(/a\/(.+?)\s+b\/(.+)/);
+        if (!headerMatch) continue;
+
+        const oldPath = headerMatch[1];
+        const newPath = headerMatch[2];
+
+        let status: DiffFile['status'] = 'modified';
+        if (section.includes('new file mode')) status = 'added';
+        else if (section.includes('deleted file mode')) status = 'deleted';
+        else if (section.includes('rename from')) status = 'renamed';
+
+        const hunks: DiffHunk[] = [];
+        let addedLines = 0;
+        let deletedLines = 0;
+        const hunkRegex = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/;
+
+        for (const line of lines) {
+            const hunkMatch = line.match(hunkRegex);
+            if (hunkMatch) {
+                hunks.push({
+                    oldStart: parseInt(hunkMatch[1], 10),
+                    oldCount: parseInt(hunkMatch[2] ?? '1', 10),
+                    newStart: parseInt(hunkMatch[3], 10),
+                    newCount: parseInt(hunkMatch[4] ?? '1', 10),
+                });
+            } else if (line.startsWith('+') && !line.startsWith('+++')) {
+                addedLines++;
+            } else if (line.startsWith('-') && !line.startsWith('---')) {
+                deletedLines++;
+            }
+        }
+
+        files.push({
+            path: status === 'deleted' ? oldPath : newPath,
+            status,
+            oldPath: status === 'renamed' ? oldPath : undefined,
+            hunks,
+            addedLines,
+            deletedLines,
+        });
+    }
+    return files;
+}
+
+function matchHunksToSymbols(
+    db: Database.Database,
+    diffFile: DiffFile
+): { changed: ChangedSymbol[]; unchangedExports: string[] } {
+    const allSymbols = db.prepare(`
+        SELECT s.name, s.qualified_name, s.kind, f.path as file,
+               s.line_start, s.line_end, s.signature, s.exported,
+               COALESCE(r.pagerank, 0) as pagerank
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        LEFT JOIN rankings r ON r.symbol_id = s.id
+        WHERE f.path = ?
+        ORDER BY s.line_start
+    `).all(diffFile.path) as any[];
+
+    if (allSymbols.length === 0) {
+        return { changed: [], unchangedExports: [] };
+    }
+
+    const mapSym = (s: any, overlap: 'full' | 'partial'): ChangedSymbol => ({
+        name: s.name,
+        qualifiedName: s.qualified_name,
+        kind: s.kind,
+        file: s.file,
+        lineStart: s.line_start,
+        lineEnd: s.line_end,
+        signature: s.signature,
+        exported: !!s.exported,
+        pagerank: s.pagerank,
+        hunkOverlap: overlap,
+    });
+
+    if (diffFile.status === 'added' || diffFile.status === 'deleted') {
+        return {
+            changed: allSymbols.map((s: any) => mapSym(s, 'full')),
+            unchangedExports: [],
+        };
+    }
+
+    // Modified/renamed: check hunk overlap with symbol line ranges
+    const changedRanges = diffFile.hunks.map(h => ({
+        start: h.newStart,
+        end: h.newStart + h.newCount - 1,
+    }));
+
+    const changed: ChangedSymbol[] = [];
+    const unchangedExports: string[] = [];
+
+    for (const sym of allSymbols) {
+        const symStart = sym.line_start;
+        const symEnd = sym.line_end;
+        let overlaps = false;
+        let fullyContained = false;
+
+        for (const range of changedRanges) {
+            if (symEnd >= range.start && symStart <= range.end) {
+                overlaps = true;
+                if (range.start <= symStart && range.end >= symEnd) {
+                    fullyContained = true;
+                }
+            }
+        }
+
+        if (overlaps) {
+            changed.push(mapSym(sym, fullyContained ? 'full' : 'partial'));
+        } else if (sym.exported) {
+            unchangedExports.push(`${sym.name} [${sym.kind}]`);
+        }
+    }
+
+    return { changed, unchangedExports };
+}
+
+function getMedianPagerank(db: Database.Database): number {
+    const count = (db.prepare('SELECT COUNT(*) as cnt FROM rankings').get() as any)?.cnt || 0;
+    if (count === 0) return 0;
+    const mid = Math.floor(count / 2);
+    const row = db.prepare('SELECT pagerank FROM rankings ORDER BY pagerank LIMIT 1 OFFSET ?').get(mid) as any;
+    return row?.pagerank || 0;
+}
+
+// --- review_diff main function ---
+
+export function reviewDiff(
+    db: Database.Database,
+    rootDir: string,
+    target: string = 'last_commit'
+): ReviewDiffResult {
+    const rawDiff = getGitDiff(rootDir, target);
+
+    if (!rawDiff.trim()) {
+        return {
+            summary: {
+                target, filesChanged: 0, filesAdded: 0, filesDeleted: 0,
+                totalAdded: 0, totalDeleted: 0, symbolsModified: 0,
+                highRiskSymbols: 0, impactedFiles: 0,
+            },
+            diff: '',
+            files: [],
+            affectedDependents: [],
+            transitiveImpact: [],
+            risks: ['No changes found for this target.'],
+        };
+    }
+
+    const diffFiles = parseDiff(rawDiff);
+
+    // Match hunks to symbols per file
+    const fileContexts: FileReviewContext[] = [];
+    const allChangedSymbols: ChangedSymbol[] = [];
+
+    for (const df of diffFiles) {
+        const { changed, unchangedExports } = matchHunksToSymbols(db, df);
+        allChangedSymbols.push(...changed);
+        fileContexts.push({
+            path: df.path,
+            status: df.status,
+            oldPath: df.oldPath,
+            addedLines: df.addedLines,
+            deletedLines: df.deletedLines,
+            changedSymbols: changed,
+            unchangedExports,
+        });
+    }
+
+    // Get callers of changed exported symbols (cross-file only)
+    const affectedDependents: AffectedDependent[] = [];
+    const seenDeps = new Set<string>();
+
+    for (const sym of allChangedSymbols) {
+        if (!sym.exported) continue;
+        const callers = getCallers(db, sym.qualifiedName || sym.name);
+        for (const caller of callers) {
+            if (caller.file === sym.file) continue;
+            const key = `${sym.name}:${caller.name}:${caller.file}`;
+            if (seenDeps.has(key)) continue;
+            seenDeps.add(key);
+            affectedDependents.push({
+                symbolName: sym.qualifiedName || sym.name,
+                symbolFile: sym.file,
+                dependentName: caller.qualifiedName || caller.name,
+                dependentFile: caller.file,
+                dependentKind: caller.kind,
+                dependentPagerank: caller.pagerank,
+            });
+        }
+    }
+
+    affectedDependents.sort((a, b) => b.dependentPagerank - a.dependentPagerank);
+
+    // Transitive file impact
+    const transitiveImpact: ImpactResult[] = [];
+    const impactedFileSet = new Set<string>();
+
+    for (const df of diffFiles) {
+        if (df.status === 'deleted') continue;
+        const impact = getImpact(db, df.path, 3);
+        for (const imp of impact) {
+            if (!impactedFileSet.has(imp.file)) {
+                impactedFileSet.add(imp.file);
+                transitiveImpact.push(imp);
+            }
+        }
+    }
+
+    // Risk assessment
+    const risks: string[] = [];
+    const medianPagerank = getMedianPagerank(db);
+    const highRankSymbols = allChangedSymbols.filter(s => s.pagerank > medianPagerank && medianPagerank > 0);
+
+    if (highRankSymbols.length > 0) {
+        risks.push(
+            `${highRankSymbols.length} high-importance symbol(s) modified: ` +
+            highRankSymbols.slice(0, 5).map(s => `${s.name} (rank=${s.pagerank.toFixed(6)})`).join(', ')
+        );
+    }
+
+    for (const sym of allChangedSymbols) {
+        if (!sym.exported) continue;
+        const depCount = affectedDependents.filter(d => d.symbolName === (sym.qualifiedName || sym.name)).length;
+        if (depCount >= 5) {
+            risks.push(`${sym.name} is exported and has ${depCount} callers in other files — changes may cascade.`);
+        }
+    }
+
+    if (transitiveImpact.length > 20) {
+        risks.push(`Large transitive impact: ${transitiveImpact.length} files could be affected.`);
+    }
+
+    for (const df of diffFiles) {
+        if (df.status !== 'deleted') continue;
+        const impact = getImpact(db, df.path, 1);
+        if (impact.length > 0) {
+            risks.push(`Deleted file ${df.path} still has ${impact.length} dependent file(s) — potential broken imports.`);
+        }
+    }
+
+    // Truncate diff if very large
+    const diffLines = rawDiff.split('\n');
+    const truncatedDiff = diffLines.length > 5000
+        ? diffLines.slice(0, 5000).join('\n') + `\n... (truncated, ${diffLines.length - 5000} more lines)`
+        : rawDiff;
+
+    return {
+        summary: {
+            target,
+            filesChanged: diffFiles.filter(f => f.status === 'modified').length,
+            filesAdded: diffFiles.filter(f => f.status === 'added').length,
+            filesDeleted: diffFiles.filter(f => f.status === 'deleted').length,
+            totalAdded: diffFiles.reduce((sum, f) => sum + f.addedLines, 0),
+            totalDeleted: diffFiles.reduce((sum, f) => sum + f.deletedLines, 0),
+            symbolsModified: allChangedSymbols.length,
+            highRiskSymbols: highRankSymbols.length,
+            impactedFiles: transitiveImpact.length,
+        },
+        diff: truncatedDiff,
+        files: fileContexts,
+        affectedDependents: affectedDependents.slice(0, 50),
+        transitiveImpact: transitiveImpact.slice(0, 30),
+        risks,
+    };
+}
+
 // --- Convenience wrappers for CLI (open/close DB internally) ---
 
 function withDb<T>(rootDir: string, fn: (db: Database.Database) => T): T {
@@ -641,4 +1009,8 @@ export function briefFromRoot(rootDir: string): string {
 
 export function preEditContextFromRoot(rootDir: string, filePath: string): string {
     return withDb(rootDir, db => preEditContext(db, filePath));
+}
+
+export function reviewDiffFromRoot(rootDir: string, target?: string): ReviewDiffResult {
+    return withDb(rootDir, db => reviewDiff(db, rootDir, target));
 }
