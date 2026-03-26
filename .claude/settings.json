@@ -1,0 +1,95 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codex__*"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex brief",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex pre-edit \"$(jq -r '.tool_input.file_path')\"",
+            "timeout": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex pre-edit \"$(jq -r '.tool_input.file_path')\"",
+            "timeout": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex pre-edit \"$(jq -r '.tool_input.file_path')\"",
+            "timeout": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex pre-edit \"$(jq -r '.tool_input.file_path')\"",
+            "timeout": 3000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex post-edit \"$(jq -r '.tool_input.file_path')\"",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex post-edit \"$(jq -r '.tool_input.file_path')\"",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-ex post-edit \"$(jq -r '.tool_input.file_path')\"",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -960,6 +960,625 @@ export function reviewDiff(
     };
 }
 
+// --- transparent_review: plain-English, zero-black-box code review ---
+
+interface SymbolBeforeAfter {
+    name: string;
+    qualifiedName: string | null;
+    kind: string;
+    file: string;
+    lineStart: number;
+    lineEnd: number;
+    signature: string | null;
+    exported: boolean;
+    pagerank: number;
+    hunkOverlap: 'full' | 'partial';
+    beforeCode: string | null;
+    afterCode: string | null;
+    diffSnippet: string;
+}
+
+interface CallerStory {
+    callerName: string;
+    callerFile: string;
+    callerKind: string;
+    callerPagerank: number;
+    callerSignature: string | null;
+    callerCode: string | null;
+    changedSymbol: string;
+    changedFile: string;
+}
+
+function getFileAtRef(rootDir: string, filePath: string, ref: string): string | null {
+    try {
+        return execSync(`git show ${ref}:${filePath}`, {
+            cwd: rootDir,
+            maxBuffer: 5 * 1024 * 1024,
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+        });
+    } catch {
+        return null;
+    }
+}
+
+function getGitRef(rootDir: string, target: string): string {
+    const opts = { cwd: rootDir, encoding: 'utf-8' as const, stdio: ['pipe', 'pipe', 'pipe'] as ('pipe')[] };
+    switch (target) {
+        case 'staged':
+        case 'last_commit':
+            return 'HEAD~1';
+        case 'branch': {
+            let baseBranch = 'main';
+            try { execSync('git rev-parse --verify main', opts); }
+            catch { baseBranch = 'master'; }
+            return execSync(`git merge-base ${baseBranch} HEAD`, opts).trim();
+        }
+        default:
+            return `${target}~1`;
+    }
+}
+
+function extractSymbolCode(fileContent: string, lineStart: number, lineEnd: number): string {
+    const lines = fileContent.split('\n');
+    return lines.slice(lineStart - 1, lineEnd).join('\n');
+}
+
+function findSymbolInOldFile(oldContent: string, symbolName: string, kind: string): string | null {
+    // Try to find the symbol definition in the old file by matching typical patterns
+    const lines = oldContent.split('\n');
+    const escapedName = symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Build patterns based on symbol kind
+    const patterns: RegExp[] = [];
+    if (kind === 'function') {
+        patterns.push(new RegExp(`^\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${escapedName}\\b`));
+        patterns.push(new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${escapedName}\\s*=`));
+    } else if (kind === 'class') {
+        patterns.push(new RegExp(`^\\s*(?:export\\s+)?(?:abstract\\s+)?class\\s+${escapedName}\\b`));
+    } else if (kind === 'interface') {
+        patterns.push(new RegExp(`^\\s*(?:export\\s+)?interface\\s+${escapedName}\\b`));
+    } else if (kind === 'type') {
+        patterns.push(new RegExp(`^\\s*(?:export\\s+)?type\\s+${escapedName}\\b`));
+    } else if (kind === 'method') {
+        const methodName = symbolName.includes('.') ? symbolName.split('.').pop()! : symbolName;
+        const escaped = methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        patterns.push(new RegExp(`^\\s*(?:async\\s+)?${escaped}\\s*\\(`));
+        patterns.push(new RegExp(`^\\s*(?:public|private|protected)?\\s*(?:async\\s+)?${escaped}\\s*\\(`));
+    } else if (kind === 'variable') {
+        patterns.push(new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${escapedName}\\b`));
+    } else if (kind === 'enum') {
+        patterns.push(new RegExp(`^\\s*(?:export\\s+)?enum\\s+${escapedName}\\b`));
+    }
+    // Fallback: just look for the name
+    patterns.push(new RegExp(`\\b${escapedName}\\b`));
+
+    for (const pattern of patterns) {
+        for (let i = 0; i < lines.length; i++) {
+            if (pattern.test(lines[i])) {
+                // Found start, now find end by tracking braces
+                const startLine = i;
+                let braceDepth = 0;
+                let foundOpenBrace = false;
+                let endLine = i;
+
+                for (let j = i; j < lines.length; j++) {
+                    for (const ch of lines[j]) {
+                        if (ch === '{') { braceDepth++; foundOpenBrace = true; }
+                        else if (ch === '}') { braceDepth--; }
+                    }
+                    endLine = j;
+                    if (foundOpenBrace && braceDepth <= 0) break;
+                    // For single-line declarations without braces
+                    if (!foundOpenBrace && j > i && !lines[j + 1]?.match(/^\s/)) break;
+                }
+
+                return lines.slice(startLine, endLine + 1).join('\n');
+            }
+        }
+    }
+
+    return null;
+}
+
+function extractDiffForRange(rawDiff: string, filePath: string, lineStart: number, lineEnd: number): string {
+    // Find the diff section for this file
+    const fileSections = rawDiff.split(/^diff --git /m).filter(Boolean);
+    for (const section of fileSections) {
+        if (!section.includes(filePath)) continue;
+
+        const lines = section.split('\n');
+        const result: string[] = [];
+        let inRelevantHunk = false;
+        let currentNewLine = 0;
+        const hunkRegex = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/;
+
+        for (const line of lines) {
+            const hunkMatch = line.match(hunkRegex);
+            if (hunkMatch) {
+                currentNewLine = parseInt(hunkMatch[3], 10);
+                const newCount = parseInt(hunkMatch[4] ?? '1', 10);
+                const hunkEnd = currentNewLine + newCount - 1;
+                // Check if this hunk overlaps with symbol range
+                inRelevantHunk = (hunkEnd >= lineStart && currentNewLine <= lineEnd);
+                if (inRelevantHunk) {
+                    result.push(line);
+                }
+                continue;
+            }
+
+            if (inRelevantHunk) {
+                if (line.startsWith('+') || line.startsWith('-') || line.startsWith(' ')) {
+                    if (!line.startsWith('-')) currentNewLine++;
+                    // Only include lines within or near the symbol range
+                    if (currentNewLine >= lineStart - 2 && currentNewLine <= lineEnd + 2) {
+                        result.push(line);
+                    } else if (line.startsWith('+') || line.startsWith('-')) {
+                        // Always include actual changes
+                        result.push(line);
+                    }
+                }
+            }
+        }
+
+        if (result.length > 0) return result.join('\n');
+    }
+    return '';
+}
+
+function describeChange(sym: SymbolBeforeAfter): string {
+    const parts: string[] = [];
+
+    if (!sym.beforeCode && sym.afterCode) {
+        parts.push(`New ${sym.kind} added.`);
+        if (sym.exported) parts.push('It is exported — other files can import it.');
+        if (sym.signature) parts.push(`Signature: ${sym.signature}`);
+        return parts.join(' ');
+    }
+
+    if (sym.beforeCode && !sym.afterCode) {
+        parts.push(`This ${sym.kind} was deleted.`);
+        if (sym.exported) parts.push('It was exported — anything importing it will break.');
+        return parts.join(' ');
+    }
+
+    if (!sym.beforeCode || !sym.afterCode) {
+        return `${sym.kind} was ${sym.hunkOverlap === 'full' ? 'fully rewritten' : 'partially modified'}.`;
+    }
+
+    const beforeLines = sym.beforeCode.split('\n');
+    const afterLines = sym.afterCode.split('\n');
+    const sizeDelta = afterLines.length - beforeLines.length;
+
+    // Analyze what changed between before and after
+    const beforeSig = beforeLines[0]?.trim() || '';
+    const afterSig = afterLines[0]?.trim() || '';
+    const sigChanged = beforeSig !== afterSig;
+
+    // Detect parameter changes
+    const paramRegex = /\(([^)]*)\)/;
+    const beforeParams = beforeSig.match(paramRegex)?.[1] || '';
+    const afterParams = afterSig.match(paramRegex)?.[1] || '';
+    const paramsChanged = beforeParams !== afterParams;
+
+    // Detect return type changes
+    const retRegex = /\):\s*(.+?)[\s{]/;
+    const beforeRet = beforeSig.match(retRegex)?.[1];
+    const afterRet = afterSig.match(retRegex)?.[1];
+    const retChanged = beforeRet !== afterRet && beforeRet && afterRet;
+
+    if (sym.hunkOverlap === 'full') {
+        parts.push(`Fully rewritten (${beforeLines.length} → ${afterLines.length} lines).`);
+    } else {
+        parts.push(`Partially modified.`);
+        if (sizeDelta > 0) parts.push(`${sizeDelta} lines added.`);
+        else if (sizeDelta < 0) parts.push(`${Math.abs(sizeDelta)} lines removed.`);
+    }
+
+    if (sigChanged) {
+        parts.push(`Signature changed.`);
+        if (paramsChanged) {
+            const bCount = beforeParams ? beforeParams.split(',').length : 0;
+            const aCount = afterParams ? afterParams.split(',').length : 0;
+            if (aCount > bCount) parts.push(`${aCount - bCount} new parameter(s) added.`);
+            else if (aCount < bCount) parts.push(`${bCount - aCount} parameter(s) removed.`);
+            else parts.push('Parameter types/names changed.');
+        }
+    }
+
+    if (retChanged) {
+        parts.push(`Return type changed: ${beforeRet} → ${afterRet}.`);
+    }
+
+    // Detect new error handling
+    const beforeHasTryCatch = /\btry\s*\{/.test(sym.beforeCode);
+    const afterHasTryCatch = /\btry\s*\{/.test(sym.afterCode);
+    if (!beforeHasTryCatch && afterHasTryCatch) parts.push('Added error handling (try/catch).');
+    if (beforeHasTryCatch && !afterHasTryCatch) parts.push('Removed error handling (try/catch).');
+
+    // Detect async changes
+    const wasAsync = /\basync\b/.test(sym.beforeCode);
+    const isAsync = /\basync\b/.test(sym.afterCode);
+    if (!wasAsync && isAsync) parts.push('Now async.');
+    if (wasAsync && !isAsync) parts.push('No longer async.');
+
+    // Detect new conditionals
+    const beforeIfs = (sym.beforeCode.match(/\bif\s*\(/g) || []).length;
+    const afterIfs = (sym.afterCode.match(/\bif\s*\(/g) || []).length;
+    if (afterIfs > beforeIfs) parts.push(`${afterIfs - beforeIfs} new conditional branch(es).`);
+    if (afterIfs < beforeIfs) parts.push(`${beforeIfs - afterIfs} conditional branch(es) removed.`);
+
+    // Detect loop changes
+    const beforeLoops = (sym.beforeCode.match(/\b(for|while|forEach)\b/g) || []).length;
+    const afterLoops = (sym.afterCode.match(/\b(for|while|forEach)\b/g) || []).length;
+    if (afterLoops > beforeLoops) parts.push(`${afterLoops - beforeLoops} new loop(s).`);
+    if (afterLoops < beforeLoops) parts.push(`${beforeLoops - afterLoops} loop(s) removed.`);
+
+    return parts.join(' ');
+}
+
+function describeCallerImpact(caller: CallerStory, sym: SymbolBeforeAfter): string {
+    const parts: string[] = [];
+    parts.push(`${caller.callerName} (${caller.callerKind} in ${caller.callerFile})`);
+    parts.push(`calls ${sym.qualifiedName || sym.name}.`);
+
+    if (!sym.beforeCode && sym.afterCode) {
+        parts.push('This is a new symbol — caller was just added or is using new functionality.');
+    } else if (sym.beforeCode && !sym.afterCode) {
+        parts.push('This symbol was DELETED — this caller WILL BREAK.');
+    } else {
+        // Check if signature changed
+        const beforeSig = sym.beforeCode?.split('\n')[0]?.trim() || '';
+        const afterSig = sym.afterCode?.split('\n')[0]?.trim() || '';
+        if (beforeSig !== afterSig) {
+            parts.push(`Signature changed, so this caller may need updating.`);
+        } else {
+            parts.push('Signature unchanged — caller compiles fine, but behavior changed.');
+        }
+    }
+
+    return parts.join(' ');
+}
+
+export function transparentReview(
+    db: Database.Database,
+    rootDir: string,
+    target: string = 'last_commit'
+): string {
+    const rawDiff = getGitDiff(rootDir, target);
+
+    if (!rawDiff.trim()) {
+        return '# Transparent Review\n\nNo changes found for target: ' + target;
+    }
+
+    const diffFiles = parseDiff(rawDiff);
+    const gitRef = getGitRef(rootDir, target);
+    const out: string[] = [];
+
+    out.push(`# Transparent Review — ${target}`);
+    out.push('');
+
+    // Quick stats
+    const added = diffFiles.filter(f => f.status === 'added').length;
+    const modified = diffFiles.filter(f => f.status === 'modified').length;
+    const deleted = diffFiles.filter(f => f.status === 'deleted').length;
+    const renamed = diffFiles.filter(f => f.status === 'renamed').length;
+    const totalAdded = diffFiles.reduce((s, f) => s + f.addedLines, 0);
+    const totalDeleted = diffFiles.reduce((s, f) => s + f.deletedLines, 0);
+
+    const statParts: string[] = [];
+    if (modified) statParts.push(`${modified} modified`);
+    if (added) statParts.push(`${added} added`);
+    if (deleted) statParts.push(`${deleted} deleted`);
+    if (renamed) statParts.push(`${renamed} renamed`);
+    out.push(`**${diffFiles.length} file(s):** ${statParts.join(', ')} — +${totalAdded} / -${totalDeleted} lines`);
+    out.push('');
+
+    // --- Per-file breakdown with full transparency ---
+    const allSymbolStories: SymbolBeforeAfter[] = [];
+
+    out.push('---');
+    out.push('## What Changed (file by file)');
+    out.push('');
+
+    for (const df of diffFiles) {
+        out.push(`### \`${df.path}\` — ${df.status}`);
+        if (df.oldPath) out.push(`  (renamed from \`${df.oldPath}\`)`);
+        out.push(`  +${df.addedLines} / -${df.deletedLines} lines`);
+        out.push('');
+
+        // Get before and after file content
+        const beforeFile = getFileAtRef(rootDir, df.oldPath || df.path, gitRef);
+        let afterFile: string | null = null;
+        if (df.status !== 'deleted') {
+            try {
+                const fs = require('fs');
+                const fullPath = require('path').join(rootDir, df.path);
+                afterFile = fs.readFileSync(fullPath, 'utf-8');
+            } catch {
+                // For committed changes, get from HEAD
+                afterFile = getFileAtRef(rootDir, df.path, 'HEAD');
+            }
+        }
+
+        // Match hunks to symbols
+        const { changed, unchangedExports } = matchHunksToSymbols(db, df);
+
+        if (changed.length === 0 && df.status === 'modified') {
+            out.push('No tracked symbols changed (changes may be in whitespace, comments, or untracked code).');
+            out.push('');
+            continue;
+        }
+
+        for (const sym of changed) {
+            // For before code: find by name in old file (line numbers shift between versions)
+            const beforeCode = beforeFile
+                ? findSymbolInOldFile(beforeFile, sym.qualifiedName?.split('.').pop() || sym.name, sym.kind)
+                : null;
+            const afterCode = afterFile
+                ? extractSymbolCode(afterFile, sym.lineStart, sym.lineEnd)
+                : null;
+            const diffSnippet = extractDiffForRange(rawDiff, df.path, sym.lineStart, sym.lineEnd);
+
+            const story: SymbolBeforeAfter = {
+                ...sym,
+                beforeCode: beforeCode && beforeCode.trim() ? beforeCode : null,
+                afterCode: afterCode && afterCode.trim() ? afterCode : null,
+                diffSnippet,
+            };
+            allSymbolStories.push(story);
+
+            const exportTag = sym.exported ? ' (exported)' : '';
+            out.push(`#### \`${sym.qualifiedName || sym.name}\` — ${sym.kind}${exportTag}`);
+            out.push('');
+
+            // Plain English description
+            const desc = describeChange(story);
+            out.push(`**What changed:** ${desc}`);
+            out.push('');
+
+            // Show before/after code
+            if (story.beforeCode && story.afterCode) {
+                out.push('<details><summary>Before</summary>');
+                out.push('');
+                out.push('```');
+                out.push(story.beforeCode);
+                out.push('```');
+                out.push('</details>');
+                out.push('');
+                out.push('<details><summary>After</summary>');
+                out.push('');
+                out.push('```');
+                out.push(story.afterCode);
+                out.push('```');
+                out.push('</details>');
+                out.push('');
+            } else if (story.afterCode) {
+                out.push('**New code:**');
+                out.push('```');
+                out.push(story.afterCode.length > 1500
+                    ? story.afterCode.slice(0, 1500) + '\n// ... truncated'
+                    : story.afterCode);
+                out.push('```');
+                out.push('');
+            } else if (story.beforeCode) {
+                out.push('**Deleted code:**');
+                out.push('```');
+                out.push(story.beforeCode.length > 1500
+                    ? story.beforeCode.slice(0, 1500) + '\n// ... truncated'
+                    : story.beforeCode);
+                out.push('```');
+                out.push('');
+            }
+
+            // Show the exact diff lines for this symbol
+            if (story.diffSnippet) {
+                out.push('<details><summary>Diff</summary>');
+                out.push('');
+                out.push('```diff');
+                out.push(story.diffSnippet);
+                out.push('```');
+                out.push('</details>');
+                out.push('');
+            }
+        }
+
+        if (unchangedExports.length > 0) {
+            out.push(`**Unchanged exports:** ${unchangedExports.join(', ')}`);
+            out.push('');
+        }
+    }
+
+    // --- Caller Impact Stories ---
+    out.push('---');
+    out.push('## Who Gets Affected');
+    out.push('');
+
+    const exportedChanged = allSymbolStories.filter(s => s.exported);
+    if (exportedChanged.length === 0) {
+        out.push('No exported symbols were changed — impact is contained to the files above.');
+        out.push('');
+    } else {
+        const callerStories: CallerStory[] = [];
+        const seenCallers = new Set<string>();
+
+        for (const sym of exportedChanged) {
+            const callers = getCallers(db, sym.qualifiedName || sym.name);
+            for (const caller of callers) {
+                if (caller.file === sym.file) continue;
+                const key = `${caller.name}:${caller.file}:${sym.name}`;
+                if (seenCallers.has(key)) continue;
+                seenCallers.add(key);
+
+                // Get the caller's actual code so we can show context
+                let callerCode: string | null = null;
+                const callerCtx = getContext(db, caller.qualifiedName || caller.name);
+                if (callerCtx) {
+                    callerCode = callerCtx.symbol.code;
+                }
+
+                callerStories.push({
+                    callerName: caller.qualifiedName || caller.name,
+                    callerFile: caller.file,
+                    callerKind: caller.kind,
+                    callerPagerank: caller.pagerank,
+                    callerSignature: caller.signature,
+                    callerCode: callerCode && callerCode.length > 800
+                        ? callerCode.slice(0, 800) + '\n// ... truncated'
+                        : callerCode,
+                    changedSymbol: sym.qualifiedName || sym.name,
+                    changedFile: sym.file,
+                });
+            }
+        }
+
+        callerStories.sort((a, b) => b.callerPagerank - a.callerPagerank);
+
+        if (callerStories.length === 0) {
+            out.push('No cross-file callers found for the changed exports.');
+            out.push('');
+        } else {
+            out.push(`**${callerStories.length} caller(s)** in other files use the changed exports:`);
+            out.push('');
+
+            for (const cs of callerStories.slice(0, 25)) {
+                const sym = allSymbolStories.find(s =>
+                    (s.qualifiedName || s.name) === cs.changedSymbol
+                );
+                if (!sym) continue;
+
+                const impact = describeCallerImpact(cs, sym);
+                out.push(`- **${cs.callerName}** in \`${cs.callerFile}\``);
+                out.push(`  ${impact}`);
+
+                if (cs.callerCode) {
+                    out.push(`  <details><summary>Caller code</summary>`);
+                    out.push('');
+                    out.push('  ```');
+                    out.push(cs.callerCode);
+                    out.push('  ```');
+                    out.push('  </details>');
+                }
+                out.push('');
+            }
+
+            if (callerStories.length > 25) {
+                out.push(`... and ${callerStories.length - 25} more callers.`);
+                out.push('');
+            }
+        }
+    }
+
+    // --- Transitive blast radius ---
+    out.push('---');
+    out.push('## Blast Radius');
+    out.push('');
+
+    const transitiveImpact: ImpactResult[] = [];
+    const impactedFileSet = new Set<string>();
+
+    for (const df of diffFiles) {
+        if (df.status === 'deleted') continue;
+        const impact = getImpact(db, df.path, 3);
+        for (const imp of impact) {
+            if (!impactedFileSet.has(imp.file)) {
+                impactedFileSet.add(imp.file);
+                transitiveImpact.push(imp);
+            }
+        }
+    }
+
+    if (transitiveImpact.length === 0) {
+        out.push('No transitive file dependencies detected — these changes are self-contained.');
+    } else {
+        out.push(`**${transitiveImpact.length} file(s)** could be transitively affected:`);
+        out.push('');
+
+        // Group by depth
+        const byDepth = new Map<number, ImpactResult[]>();
+        for (const imp of transitiveImpact) {
+            if (!byDepth.has(imp.depth)) byDepth.set(imp.depth, []);
+            byDepth.get(imp.depth)!.push(imp);
+        }
+
+        for (const [depth, files] of [...byDepth.entries()].sort((a, b) => a[0] - b[0])) {
+            const label = depth === 1 ? 'Direct importers' : `${depth} levels deep`;
+            out.push(`**${label}** (${files.length} file${files.length > 1 ? 's' : ''}):`);
+            for (const f of files.slice(0, 15)) {
+                out.push(`  - \`${f.file}\` (${f.symbolCount} symbols)`);
+            }
+            if (files.length > 15) {
+                out.push(`  - ... and ${files.length - 15} more`);
+            }
+            out.push('');
+        }
+    }
+
+    // --- Risk Summary ---
+    out.push('---');
+    out.push('## Risk Summary');
+    out.push('');
+
+    const medianPagerank = getMedianPagerank(db);
+    const risks: string[] = [];
+
+    // High-importance symbols
+    const highRank = allSymbolStories.filter(s => s.pagerank > medianPagerank && medianPagerank > 0);
+    if (highRank.length > 0) {
+        risks.push(`**High-importance code touched:** ${highRank.map(s => `\`${s.name}\` (rank #${s.pagerank.toFixed(6)})`).join(', ')} — these are among the most-referenced symbols in the project. Changes here ripple widely.`);
+    }
+
+    // Cascade risk
+    for (const sym of exportedChanged) {
+        const callerCount = allSymbolStories.length > 0
+            ? getCallers(db, sym.qualifiedName || sym.name).filter(c => c.file !== sym.file).length
+            : 0;
+        if (callerCount >= 5) {
+            risks.push(`**Cascade risk:** \`${sym.name}\` has ${callerCount} callers in other files. Behavioral changes will propagate to all of them.`);
+        }
+    }
+
+    // Large blast radius
+    if (transitiveImpact.length > 20) {
+        risks.push(`**Wide blast radius:** ${transitiveImpact.length} files could be transitively affected. Consider testing downstream modules.`);
+    }
+
+    // Deleted files with dependents
+    for (const df of diffFiles) {
+        if (df.status !== 'deleted') continue;
+        const impact = getImpact(db, df.path, 1);
+        if (impact.length > 0) {
+            risks.push(`**Broken imports likely:** Deleted \`${df.path}\` still has ${impact.length} file(s) importing from it: ${impact.slice(0, 5).map(i => `\`${i.file}\``).join(', ')}`);
+        }
+    }
+
+    // Signature changes on exported symbols
+    for (const sym of exportedChanged) {
+        if (sym.beforeCode && sym.afterCode) {
+            const bSig = sym.beforeCode.split('\n')[0]?.trim();
+            const aSig = sym.afterCode.split('\n')[0]?.trim();
+            if (bSig !== aSig) {
+                risks.push(`**API change:** \`${sym.name}\` signature changed. Callers may need to update their call sites.`);
+            }
+        }
+    }
+
+    if (risks.length === 0) {
+        out.push('No significant risks detected. Changes look contained and low-impact.');
+    } else {
+        for (const risk of risks) {
+            out.push(`- ${risk}`);
+        }
+    }
+
+    out.push('');
+    return out.join('\n');
+}
+
+export function transparentReviewFromRoot(rootDir: string, target?: string): string {
+    return withDb(rootDir, db => transparentReview(db, rootDir, target));
+}
+
 // --- Convenience wrappers for CLI (open/close DB internally) ---
 
 function withDb<T>(rootDir: string, fn: (db: Database.Database) => T): T {

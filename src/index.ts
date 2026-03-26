@@ -8,7 +8,7 @@ import {
     searchFromRoot, getCallersFromRoot, getContextFromRoot,
     getImpactFromRoot, getDepsFromRoot, getRankFromRoot,
     getModulesFromRoot, getStatsFromRoot, briefFromRoot,
-    preEditContextFromRoot, reviewDiffFromRoot,
+    preEditContextFromRoot, reviewDiffFromRoot, transparentReviewFromRoot,
 } from './query/engine';
 import { install } from './claude/installer';
 import { writeClaudeMd } from './claude/claudemd';
@@ -225,6 +225,17 @@ program
         const rootDir = requireIndex();
         const result = reviewDiffFromRoot(rootDir, target || 'last_commit');
         console.log(JSON.stringify(result, null, 2));
+    });
+
+// --- transparent-review ---
+program
+    .command('transparent-review')
+    .argument('[target]', 'What to review: last_commit (default), staged, branch, or commit SHA')
+    .description('Zero-black-box review: shows exact before/after code, plain-English explanations, caller impact, and blast radius')
+    .action((target) => {
+        const rootDir = requireIndex();
+        const result = transparentReviewFromRoot(rootDir, target || 'last_commit');
+        console.log(result);
     });
 
 // --- generate-docs ---

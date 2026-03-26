@@ -11,7 +11,7 @@ import {
     search, getCallers, getContext, getImpact,
     getDeps, getRank, getModules, getStats, findFiles, getFileMap,
     getFileSymbols, findByKind, getTypeHierarchy, findDeadExports, getPkgUsages,
-    reviewDiff,
+    reviewDiff, transparentReview,
 } from '../query/engine';
 import { reindexFile } from '../indexer';
 
@@ -211,6 +211,16 @@ export async function runMcpServer(): Promise<void> {
                     },
                 },
             },
+            {
+                name: 'transparent_review',
+                description: 'Zero-black-box code review. Shows EXACT before/after code for every changed symbol, plain-English explanation of what each change does (parameter changes, new branches, error handling, async changes), who calls the changed code and how they are affected, full blast radius grouped by depth, and risk assessment. Returns a readable narrative — not raw JSON. Use this when you want to truly understand a diff, not just see metadata about it.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        target: { type: 'string', description: 'What to review: "last_commit" (default), "staged", "branch" (diff vs main/master), or a commit SHA' },
+                    },
+                },
+            },
         ],
     }));
 
@@ -278,6 +288,14 @@ export async function runMcpServer(): Promise<void> {
                 case 'review_diff':
                     result = reviewDiff(db, rootDir, (args as any)?.target || 'last_commit');
                     break;
+                case 'transparent_review': {
+                    const narrative = transparentReview(db, rootDir, (args as any)?.target || 'last_commit');
+                    const elapsed2 = (performance.now() - callStart).toFixed(1);
+                    process.stderr.write(`[codex-mcp] transparent_review completed in ${elapsed2}ms\n`);
+                    return {
+                        content: [{ type: 'text' as const, text: narrative }],
+                    };
+                }
                 default:
                     return {
                         content: [{ type: 'text' as const, text: `Unknown tool: ${name}` }],
