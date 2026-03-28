@@ -40,14 +40,16 @@ export async function runMcpServer(): Promise<void> {
         process.stderr.write(`[codex-mcp] Watcher failed to start: ${err}\n`);
     }
 
+    // Pre-warm statement cache + SQLite page cache
+    try { getStats(db); search(db, 'a', 1); } catch { /* warm-up, ignore errors */ }
+
     const server = new Server(
         { name: 'claude-ex', version: '1.0.0' },
         { capabilities: { tools: {} } }
     );
 
-    // Register tools
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: [
+    // Memoized tool list (allocated once, not per request)
+    const TOOL_LIST = [
             {
                 name: 'search_code',
                 description: 'Search codebase for symbols by name, description, or content. Results ranked by structural importance (PageRank). Faster and more precise than grep for finding the right code.',
@@ -221,8 +223,9 @@ export async function runMcpServer(): Promise<void> {
                     },
                 },
             },
-        ],
-    }));
+    ];
+
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_LIST }));
 
     // Handle tool calls
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -309,7 +312,7 @@ export async function runMcpServer(): Promise<void> {
             return {
                 content: [{
                     type: 'text' as const,
-                    text: JSON.stringify(result, null, 2),
+                    text: JSON.stringify(result),
                 }],
             };
         } catch (err: any) {

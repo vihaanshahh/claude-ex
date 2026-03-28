@@ -18,29 +18,38 @@ export interface IndexStats {
     timeMs: number;
 }
 
-function resolveImportPath(rootDir: string, fromFile: string, importSource: string): string | null {
-    // Skip non-relative imports (packages)
+const RESOLVE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', ''];
+const RESOLVE_INDEX_FILES = ['/index.ts', '/index.tsx', '/index.js', '/index.jsx'];
+
+function resolveImportPath(rootDir: string, fromFile: string, importSource: string, knownFiles?: Set<string>): string | null {
     if (!importSource.startsWith('.') && !importSource.startsWith('/')) return null;
 
     const fromDir = path.dirname(path.join(rootDir, fromFile));
     const resolved = path.resolve(fromDir, importSource);
     const rel = path.relative(rootDir, resolved);
 
-    const extensions = ['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', ''];
-    const indexFiles = ['/index.ts', '/index.tsx', '/index.js', '/index.jsx'];
+    // Fast path: use pre-computed file set (no fs.existsSync calls)
+    if (knownFiles) {
+        for (const ext of RESOLVE_EXTENSIONS) {
+            const candidate = rel + ext;
+            if (knownFiles.has(candidate)) return candidate;
+        }
+        for (const idx of RESOLVE_INDEX_FILES) {
+            const candidate = rel + idx;
+            if (knownFiles.has(candidate)) return candidate;
+        }
+        return null;
+    }
 
-    // Try direct match with extensions
-    for (const ext of extensions) {
+    // Slow path: filesystem check (used by reindexFile for single files)
+    for (const ext of RESOLVE_EXTENSIONS) {
         const candidate = rel + ext;
         if (fs.existsSync(path.join(rootDir, candidate))) return candidate;
     }
-
-    // Try index files in directory
-    for (const idx of indexFiles) {
+    for (const idx of RESOLVE_INDEX_FILES) {
         const candidate = rel + idx;
         if (fs.existsSync(path.join(rootDir, candidate))) return candidate;
     }
-
     return null;
 }
 
@@ -72,6 +81,11 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
     const fileImportMap = new Map<string, { resolved: string; names: string[] }[]>();
     const validPaths = new Set(files);
 
+    const lookupFileStmt = db.prepare('SELECT id FROM files WHERE path = ?');
+    const lookupExistingSymsStmt = db.prepare(
+        'SELECT id, name, qualified_name, exported FROM symbols WHERE file_id = ?'
+    );
+
     const transaction = db.transaction(() => {
         for (const relPath of files) {
             const fullPath = path.join(rootDir, relPath);
@@ -92,9 +106,7 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
             if (!fileRecord.changed) {
                 skippedFiles++;
                 // Still need to track existing symbols for cross-file resolution
-                const existingSymbols = db.prepare(
-                    'SELECT id, name, qualified_name, exported FROM symbols WHERE file_id = ?'
-                ).all(fileRecord.id) as { id: number; name: string; qualified_name: string | null; exported: number }[];
+                const existingSymbols = lookupExistingSymsStmt.all(fileRecord.id) as { id: number; name: string; qualified_name: string | null; exported: number }[];
                 const symbolMap = new Map<string, number>();
                 for (const s of existingSymbols) {
                     if (s.exported) {
@@ -171,10 +183,9 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
                     continue;
                 }
 
-                const resolved = resolveImportPath(rootDir, relPath, imp.source);
+                const resolved = resolveImportPath(rootDir, relPath, imp.source, validPaths);
                 if (resolved) {
-                    // Create file dep
-                    const toFile = db.prepare('SELECT id FROM files WHERE path = ?').get(resolved) as { id: number } | undefined;
+                    const toFile = lookupFileStmt.get(resolved) as { id: number } | undefined;
                     if (toFile) {
                         const importName = imp.names.length > 0 ? imp.names.join(',') : '*';
                         insertFileDep(db, fileRecord.id, toFile.id, 'import', importName);
@@ -336,7 +347,7 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
 
         const resolved = resolveImportPath(rootDir, relPath, imp.source);
         if (resolved) {
-            const toFile = db.prepare('SELECT id FROM files WHERE path = ?').get(resolved) as { id: number } | undefined;
+            const toFile = db.prepare('SELECT id FROM files WHERE path = ?').get(resolved) as { id: number } | undefined;  // reindexFile: single file, not hot loop
             if (toFile) {
                 insertFileDep(db, fileRecord.id, toFile.id, 'import', imp.names.join(',') || '*');
             }
@@ -387,23 +398,27 @@ function computePageRank(db: Database.Database, iterations: number = 20, damping
         }
     }
 
-    // PageRank iteration
+    // PageRank iteration — O(n + edges) per iteration, not O(n²)
     let rank = new Float64Array(n).fill(1 / n);
     let newRank = new Float64Array(n);
 
     for (let iter = 0; iter < iterations; iter++) {
-        newRank.fill((1 - damping) / n);
+        // Pre-compute dangling mass (nodes with no outgoing edges)
+        let danglingMass = 0;
+        for (let i = 0; i < n; i++) {
+            if (outDegree[i] === 0) danglingMass += rank[i];
+        }
+        const danglingShare = damping * danglingMass / n;
+
+        // Base: teleport + dangling distribution (uniform)
+        newRank.fill((1 - damping) / n + danglingShare);
+
+        // Add rank contributions from edges
         for (let i = 0; i < n; i++) {
             if (outDegree[i] > 0) {
-                const share = rank[i] / outDegree[i];
+                const share = damping * rank[i] / outDegree[i];
                 for (const j of outgoing[i]) {
-                    newRank[j] += damping * share;
-                }
-            } else {
-                // Distribute dangling node's rank
-                const share = rank[i] / n;
-                for (let j = 0; j < n; j++) {
-                    newRank[j] += damping * share;
+                    newRank[j] += share;
                 }
             }
         }

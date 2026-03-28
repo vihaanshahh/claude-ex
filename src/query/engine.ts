@@ -2,6 +2,18 @@ import Database from 'better-sqlite3';
 import { execSync } from 'child_process';
 import { openDatabase } from '../db/schema';
 
+// --- Prepared statement cache ---
+// Each db connection gets its own cache; WeakMap ensures cleanup when db is GCed.
+const stmtCache = new WeakMap<Database.Database, Map<string, Database.Statement>>();
+
+function cached(db: Database.Database, sql: string): Database.Statement {
+    let cache = stmtCache.get(db);
+    if (!cache) { cache = new Map(); stmtCache.set(db, cache); }
+    let stmt = cache.get(sql);
+    if (!stmt) { stmt = db.prepare(sql); cache.set(sql, stmt); }
+    return stmt;
+}
+
 // Result types
 export interface SearchResult {
     name: string;
@@ -52,11 +64,15 @@ export interface Stats {
     fileDeps: number;
 }
 
-// FTS5 query sanitizer
+// FTS5 query sanitizer — uses NEAR for multi-token phrase matching
 function sanitizeFts(query: string): string {
     const tokens = query.replace(/[^\w\s]/g, ' ').trim().split(/\s+/).filter(Boolean);
     if (tokens.length === 0) return '';
-    return tokens.map(t => `"${t}"`).join(' OR ');
+    if (tokens.length === 1) return `"${tokens[0]}"`;
+    // Multi-token: prefer NEAR phrase match, fall back to OR for partial matches
+    const phrase = tokens.map(t => `"${t}"`).join(' NEAR ');
+    const orFallback = tokens.map(t => `"${t}"`).join(' OR ');
+    return `(${phrase}) OR (${orFallback})`;
 }
 
 // --- DB-direct functions (for MCP server hot path) ---
@@ -65,11 +81,11 @@ export function search(db: Database.Database, query: string, limit: number = 15)
     const ftsQuery = sanitizeFts(query);
     if (!ftsQuery) return [];
 
-    const stmt = db.prepare(`
+    // Primary: FTS5 word-level search (fast, ranked)
+    const results = cached(db, `
         SELECT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
-               COALESCE(r.pagerank, 0) as pagerank,
-               snippet(symbols_fts, 4, '>>>', '<<<', '...', 30) as snippet
+               COALESCE(r.pagerank, 0) as pagerank
         FROM symbols_fts fts
         JOIN symbols s ON s.id = fts.rowid
         JOIN files f ON f.id = s.file_id
@@ -77,12 +93,47 @@ export function search(db: Database.Database, query: string, limit: number = 15)
         WHERE symbols_fts MATCH ?
         ORDER BY r.pagerank DESC, fts.rank
         LIMIT ?
-    `);
-    return stmt.all(ftsQuery, limit) as SearchResult[];
+    `).all(ftsQuery, limit) as SearchResult[];
+
+    // If FTS has enough results, return immediately
+    if (results.length >= limit) return results;
+
+    // Fallback: trigram substring search for partial/camelCase matches
+    try {
+        const seenIds = new Set(results.map(r => `${r.name}:${r.file}`));
+        const cleaned = query.replace(/[^\w\s]/g, '').trim();
+        if (cleaned.length < 3) return results;
+
+        const trigramResults = cached(db, `
+            SELECT s.name, s.qualified_name, s.kind, f.path as file,
+                   s.line_start, s.line_end, s.signature,
+                   COALESCE(r.pagerank, 0) as pagerank
+            FROM symbols_trigram tri
+            JOIN symbols s ON s.id = tri.rowid
+            JOIN files f ON f.id = s.file_id
+            LEFT JOIN rankings r ON r.symbol_id = s.id
+            WHERE symbols_trigram MATCH ?
+            ORDER BY r.pagerank DESC
+            LIMIT ?
+        `).all(cleaned, limit) as SearchResult[];
+
+        for (const r of trigramResults) {
+            const key = `${r.name}:${r.file}`;
+            if (!seenIds.has(key)) {
+                results.push(r);
+                seenIds.add(key);
+                if (results.length >= limit) break;
+            }
+        }
+    } catch {
+        // Trigram table may not exist on older DBs
+    }
+
+    return results;
 }
 
 export function getCallers(db: Database.Database, symbolName: string): SearchResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT DISTINCT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
                COALESCE(r.pagerank, 0) as pagerank
@@ -94,13 +145,11 @@ export function getCallers(db: Database.Database, symbolName: string): SearchRes
         WHERE (target.name = ? OR target.qualified_name = ?)
           AND e.kind IN ('calls', 'references')
         ORDER BY r.pagerank DESC
-    `);
-    return stmt.all(symbolName, symbolName) as SearchResult[];
+    `).all(symbolName, symbolName) as SearchResult[];
 }
 
 export function getContext(db: Database.Database, symbolName: string): ContextResult | null {
-    // Find the symbol (prefer exported, highest pagerank)
-    const sym = db.prepare(`
+    const sym = cached(db, `
         SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature, s.docstring, s.content as code,
                s.file_id
@@ -114,8 +163,7 @@ export function getContext(db: Database.Database, symbolName: string): ContextRe
 
     if (!sym) return null;
 
-    // Dependencies (edges FROM this symbol)
-    const deps = db.prepare(`
+    const deps = cached(db, `
         SELECT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
                COALESCE(r.pagerank, 0) as pagerank
@@ -126,8 +174,7 @@ export function getContext(db: Database.Database, symbolName: string): ContextRe
         WHERE e.from_id = ?
     `).all(sym.id) as SearchResult[];
 
-    // Dependents (edges TO this symbol)
-    const dependents = db.prepare(`
+    const dependents = cached(db, `
         SELECT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
                COALESCE(r.pagerank, 0) as pagerank
@@ -138,8 +185,7 @@ export function getContext(db: Database.Database, symbolName: string): ContextRe
         WHERE e.to_id = ?
     `).all(sym.id) as SearchResult[];
 
-    // Same-file siblings
-    const siblings = db.prepare(`
+    const siblings = cached(db, `
         SELECT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
                COALESCE(r.pagerank, 0) as pagerank
@@ -169,7 +215,7 @@ export function getContext(db: Database.Database, symbolName: string): ContextRe
 }
 
 export function getImpact(db: Database.Database, filePath: string, maxDepth: number = 10): ImpactResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         WITH RECURSIVE impact(file_id, depth) AS (
             SELECT fd.from_file, 1
             FROM file_deps fd
@@ -187,12 +233,11 @@ export function getImpact(db: Database.Database, filePath: string, maxDepth: num
         JOIN files f ON f.id = i.file_id
         GROUP BY f.path
         ORDER BY depth, symbolCount DESC
-    `);
-    return stmt.all(filePath, maxDepth) as ImpactResult[];
+    `).all(filePath, maxDepth) as ImpactResult[];
 }
 
 export function getDeps(db: Database.Database, symbolName: string): SearchResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT DISTINCT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
                COALESCE(r.pagerank, 0) as pagerank
@@ -203,12 +248,11 @@ export function getDeps(db: Database.Database, symbolName: string): SearchResult
         LEFT JOIN rankings r ON r.symbol_id = s.id
         WHERE (source.name = ? OR source.qualified_name = ?)
         ORDER BY r.pagerank DESC
-    `);
-    return stmt.all(symbolName, symbolName) as SearchResult[];
+    `).all(symbolName, symbolName) as SearchResult[];
 }
 
 export function getRank(db: Database.Database, top: number = 20): SearchResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
                r.pagerank
@@ -218,57 +262,54 @@ export function getRank(db: Database.Database, top: number = 20): SearchResult[]
         WHERE s.kind IN ('function', 'class', 'method', 'interface', 'type')
         ORDER BY r.pagerank DESC
         LIMIT ?
-    `);
-    return stmt.all(top) as SearchResult[];
+    `).all(top) as SearchResult[];
 }
 
 export function getModules(db: Database.Database): ModuleResult[] {
-    // Group files by top-level directory
-    const files = db.prepare(`
-        SELECT f.id, f.path,
-               CASE WHEN INSTR(f.path, '/') > 0
-                    THEN SUBSTR(f.path, 1, INSTR(f.path, '/') - 1)
-                    ELSE '.'
-               END as module
+    // Single query: files grouped by module with symbol counts
+    const moduleRows = cached(db, `
+        SELECT
+            CASE WHEN INSTR(f.path, '/') > 0
+                 THEN SUBSTR(f.path, 1, INSTR(f.path, '/') - 1)
+                 ELSE '.'
+            END as module,
+            COUNT(DISTINCT f.id) as fileCount,
+            COUNT(DISTINCT s.id) as symbolCount
         FROM files f
-    `).all() as { id: number; path: string; module: string }[];
+        LEFT JOIN symbols s ON s.file_id = f.id
+        GROUP BY module
+    `).all() as { module: string; fileCount: number; symbolCount: number }[];
 
-    const moduleMap = new Map<string, { fileIds: Set<number>; files: string[] }>();
-    for (const f of files) {
-        if (!moduleMap.has(f.module)) {
-            moduleMap.set(f.module, { fileIds: new Set(), files: [] });
-        }
-        moduleMap.get(f.module)!.fileIds.add(f.id);
-        moduleMap.get(f.module)!.files.push(f.path);
+    // Single query: all cross-module imports
+    const depRows = cached(db, `
+        SELECT DISTINCT
+            CASE WHEN INSTR(f1.path, '/') > 0
+                 THEN SUBSTR(f1.path, 1, INSTR(f1.path, '/') - 1)
+                 ELSE '.'
+            END as from_module,
+            CASE WHEN INSTR(f2.path, '/') > 0
+                 THEN SUBSTR(f2.path, 1, INSTR(f2.path, '/') - 1)
+                 ELSE '.'
+            END as to_module
+        FROM file_deps fd
+        JOIN files f1 ON f1.id = fd.from_file
+        JOIN files f2 ON f2.id = fd.to_file
+    `).all() as { from_module: string; to_module: string }[];
+
+    // Build dep map
+    const depMap = new Map<string, Set<string>>();
+    for (const row of depRows) {
+        if (row.from_module === row.to_module) continue;
+        if (!depMap.has(row.from_module)) depMap.set(row.from_module, new Set());
+        depMap.get(row.from_module)!.add(row.to_module);
     }
 
-    const results: ModuleResult[] = [];
-    for (const [name, data] of moduleMap) {
-        const symbolCount = db.prepare(
-            `SELECT COUNT(*) as cnt FROM symbols WHERE file_id IN (${[...data.fileIds].join(',')})`
-        ).get() as { cnt: number };
-
-        // Find which other modules this module imports from
-        const deps = db.prepare(`
-            SELECT DISTINCT
-                CASE WHEN INSTR(f2.path, '/') > 0
-                     THEN SUBSTR(f2.path, 1, INSTR(f2.path, '/') - 1)
-                     ELSE '.'
-                END as target_module
-            FROM file_deps fd
-            JOIN files f2 ON f2.id = fd.to_file
-            WHERE fd.from_file IN (${[...data.fileIds].join(',')})
-        `).all() as { target_module: string }[];
-
-        results.push({
-            name,
-            fileCount: data.files.length,
-            symbolCount: symbolCount.cnt,
-            importsFrom: deps.map(d => d.target_module).filter(m => m !== name),
-        });
-    }
-
-    return results.sort((a, b) => b.symbolCount - a.symbolCount);
+    return moduleRows.map(m => ({
+        name: m.module,
+        fileCount: m.fileCount,
+        symbolCount: m.symbolCount,
+        importsFrom: [...(depMap.get(m.module) || [])],
+    })).sort((a, b) => b.symbolCount - a.symbolCount);
 }
 
 export interface FileResult {
@@ -278,21 +319,17 @@ export interface FileResult {
 }
 
 export function findFiles(db: Database.Database, pattern: string, limit: number = 50): FileResult[] {
-    // Convert glob-like pattern to SQL GLOB pattern
-    // SQL GLOB uses * for any chars and ? for single char (same as shell glob)
-    // But we want ** to match path separators too, which GLOB * already does
     const sqlPattern = pattern
-        .replace(/\*\*/g, '*')  // ** -> * (SQL GLOB * matches everything including /)
-        .replace(/\.\*/g, '.*'); // preserve .* as literal
+        .replace(/\*\*/g, '*')
+        .replace(/\.\*/g, '.*');
 
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT path, language, line_count as lineCount
         FROM files
         WHERE path GLOB ?
         ORDER BY path
         LIMIT ?
-    `);
-    return stmt.all(sqlPattern, limit) as FileResult[];
+    `).all(sqlPattern, limit) as FileResult[];
 }
 
 export interface FileMapEntry {
@@ -312,66 +349,53 @@ function isProjectFile(filePath: string): boolean {
 
 /** Returns a map of every project file → what it exports. This is the "memory" of the project. */
 export function getFileMap(db: Database.Database): FileMapEntry[] {
-    const files = db.prepare(`
-        SELECT f.id, f.path, f.language, f.line_count as lineCount
+    // Single query: all files with their exports via GROUP_CONCAT
+    const rows = cached(db, `
+        SELECT f.path, f.language, f.line_count as lineCount,
+               GROUP_CONCAT(s.name || ' [' || s.kind || ']', '|||') as exports_str
         FROM files f
+        LEFT JOIN symbols s ON s.file_id = f.id AND s.exported = 1
+        GROUP BY f.id
         ORDER BY f.path
-    `).all() as { id: number; path: string; language: string | null; lineCount: number }[];
+    `).all() as { path: string; language: string | null; lineCount: number; exports_str: string | null }[];
 
-    const exportStmt = db.prepare(`
-        SELECT name, kind, signature FROM symbols
-        WHERE file_id = ? AND exported = 1
-        ORDER BY line_start
-    `);
-
-    const results: FileMapEntry[] = [];
-    for (const f of files) {
-        if (!isProjectFile(f.path)) continue;
-        const exports = exportStmt.all(f.id) as { name: string; kind: string; signature: string | null }[];
-        results.push({
-            path: f.path,
-            language: f.language,
-            lineCount: f.lineCount,
-            exports: exports.map(e => `${e.name} [${e.kind}]`),
-        });
-    }
-    return results;
+    return rows
+        .filter(r => isProjectFile(r.path))
+        .map(r => ({
+            path: r.path,
+            language: r.language,
+            lineCount: r.lineCount,
+            exports: r.exports_str ? r.exports_str.split('|||') : [],
+        }));
 }
 
 /** Compact file map string for embedding in CLAUDE.md / brief */
 export function getFileMapCompact(db: Database.Database, maxFiles: number = 80): string {
-    const files = db.prepare(`
-        SELECT f.id, f.path, f.language, f.line_count as lineCount
+    // Single query: files with top-8 exports by pagerank and total export count
+    const rows = cached(db, `
+        SELECT f.id, f.path,
+               (SELECT COUNT(*) FROM symbols WHERE file_id = f.id AND exported = 1) as totalExports,
+               (SELECT GROUP_CONCAT(name, ', ')
+                FROM (SELECT s.name FROM symbols s
+                      LEFT JOIN rankings r ON r.symbol_id = s.id
+                      WHERE s.file_id = f.id AND s.exported = 1
+                      ORDER BY COALESCE(r.pagerank, 0) DESC LIMIT 8)
+               ) as topNames
         FROM files f
         ORDER BY f.path
-    `).all() as { id: number; path: string; language: string | null; lineCount: number }[];
+    `).all() as { id: number; path: string; totalExports: number; topNames: string | null }[];
 
-    const projectFiles = files.filter(f => isProjectFile(f.path));
-
-    const exportStmt = db.prepare(`
-        SELECT name, kind FROM symbols
-        WHERE file_id = ? AND exported = 1
-        ORDER BY COALESCE((SELECT pagerank FROM rankings WHERE symbol_id = symbols.id), 0) DESC
-        LIMIT 8
-    `);
-
-    const allExportStmt = db.prepare(`
-        SELECT COUNT(*) as cnt FROM symbols WHERE file_id = ? AND exported = 1
-    `);
-
+    const projectFiles = rows.filter(r => isProjectFile(r.path));
     const lines: string[] = [];
     const shown = projectFiles.slice(0, maxFiles);
 
     for (const f of shown) {
-        const exports = exportStmt.all(f.id) as { name: string; kind: string }[];
-        const totalExports = (allExportStmt.get(f.id) as { cnt: number }).cnt;
-
-        if (exports.length === 0) {
+        if (!f.topNames || f.totalExports === 0) {
             lines.push(`- \`${f.path}\``);
         } else {
-            const names = exports.map(e => e.name);
-            const suffix = totalExports > names.length ? ` +${totalExports - names.length} more` : '';
-            lines.push(`- \`${f.path}\` — ${names.join(', ')}${suffix}`);
+            const names = f.topNames.split(', ');
+            const suffix = f.totalExports > names.length ? ` +${f.totalExports - names.length} more` : '';
+            lines.push(`- \`${f.path}\` — ${f.topNames}${suffix}`);
         }
     }
 
@@ -383,11 +407,13 @@ export function getFileMapCompact(db: Database.Database, maxFiles: number = 80):
 }
 
 export function getStats(db: Database.Database): Stats {
-    const files = (db.prepare('SELECT COUNT(*) as cnt FROM files').get() as any).cnt;
-    const symbols = (db.prepare('SELECT COUNT(*) as cnt FROM symbols').get() as any).cnt;
-    const edges = (db.prepare('SELECT COUNT(*) as cnt FROM edges').get() as any).cnt;
-    const fileDeps = (db.prepare('SELECT COUNT(*) as cnt FROM file_deps').get() as any).cnt;
-    return { files, symbols, edges, fileDeps };
+    return cached(db, `
+        SELECT
+            (SELECT COUNT(*) FROM files) as files,
+            (SELECT COUNT(*) FROM symbols) as symbols,
+            (SELECT COUNT(*) FROM edges) as edges,
+            (SELECT COUNT(*) FROM file_deps) as fileDeps
+    `).get() as Stats;
 }
 
 export function brief(db: Database.Database): string {
@@ -396,7 +422,7 @@ export function brief(db: Database.Database): string {
     const modules = getModules(db);
 
     // Language breakdown
-    const langs = db.prepare(`
+    const langs = cached(db, `
         SELECT language, COUNT(*) as cnt FROM files WHERE language IS NOT NULL GROUP BY language ORDER BY cnt DESC
     `).all() as { language: string; cnt: number }[];
 
@@ -433,13 +459,13 @@ export function brief(db: Database.Database): string {
 }
 
 export function preEditContext(db: Database.Database, filePath: string): string {
-    const file = db.prepare('SELECT id FROM files WHERE path = ?').get(filePath) as { id: number } | undefined;
+    const file = cached(db, 'SELECT id FROM files WHERE path = ?').get(filePath) as { id: number } | undefined;
     if (!file) return `File ${filePath} not in index.`;
 
     const lines: string[] = [];
 
     // What this file exports
-    const exports = db.prepare(`
+    const exports = cached(db, `
         SELECT name, kind, signature FROM symbols WHERE file_id = ? AND exported = 1 ORDER BY line_start
     `).all(file.id) as { name: string; kind: string; signature: string | null }[];
 
@@ -451,7 +477,7 @@ export function preEditContext(db: Database.Database, filePath: string): string 
     }
 
     // What files import from this file
-    const dependents = db.prepare(`
+    const dependents = cached(db, `
         SELECT DISTINCT f.path FROM file_deps fd JOIN files f ON f.id = fd.from_file WHERE fd.to_file = ?
     `).all(file.id) as { path: string }[];
 
@@ -467,7 +493,7 @@ export function preEditContext(db: Database.Database, filePath: string): string 
     }
 
     // What this file imports
-    const imports = db.prepare(`
+    const imports = cached(db, `
         SELECT f.path, fd.import_name FROM file_deps fd JOIN files f ON f.id = fd.to_file WHERE fd.from_file = ?
     `).all(file.id) as { path: string; import_name: string }[];
 
@@ -497,20 +523,19 @@ export interface FileSymbolResult {
 
 /** Get all symbols in a specific file */
 export function getFileSymbols(db: Database.Database, filePath: string): FileSymbolResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT s.name, s.qualified_name as qualifiedName, s.kind, s.line_start as lineStart,
                s.line_end as lineEnd, s.signature, s.exported, s.parameters
         FROM symbols s
         JOIN files f ON f.id = s.file_id
         WHERE f.path = ?
         ORDER BY s.line_start
-    `);
-    return stmt.all(filePath) as FileSymbolResult[];
+    `).all(filePath) as FileSymbolResult[];
 }
 
 /** Find symbols by kind (class, function, interface, type, enum, method, variable) */
 export function findByKind(db: Database.Database, kind: string, limit: number = 50): SearchResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature,
                COALESCE(r.pagerank, 0) as pagerank
@@ -520,8 +545,7 @@ export function findByKind(db: Database.Database, kind: string, limit: number = 
         WHERE s.kind = ?
         ORDER BY r.pagerank DESC
         LIMIT ?
-    `);
-    return stmt.all(kind, limit) as SearchResult[];
+    `).all(kind, limit) as SearchResult[];
 }
 
 export interface TypeHierarchyResult {
@@ -535,7 +559,7 @@ export interface TypeHierarchyResult {
 
 /** Find all classes/interfaces that extend or implement a given name */
 export function getTypeHierarchy(db: Database.Database, parentName: string): TypeHierarchyResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT s.name, s.qualified_name as qualifiedName, s.kind, f.path as file,
                s.line_start as lineStart, tr.kind as relationKind
         FROM type_relations tr
@@ -543,8 +567,7 @@ export function getTypeHierarchy(db: Database.Database, parentName: string): Typ
         JOIN files f ON f.id = s.file_id
         WHERE tr.parent_name = ?
         ORDER BY tr.kind, s.name
-    `);
-    return stmt.all(parentName) as TypeHierarchyResult[];
+    `).all(parentName) as TypeHierarchyResult[];
 }
 
 export interface DeadExportResult {
@@ -556,7 +579,7 @@ export interface DeadExportResult {
 
 /** Find exported symbols that nothing references or imports */
 export function findDeadExports(db: Database.Database, limit: number = 50): DeadExportResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT s.name, s.kind, f.path as file, s.line_start as lineStart
         FROM symbols s
         JOIN files f ON f.id = s.file_id
@@ -572,8 +595,7 @@ export function findDeadExports(db: Database.Database, limit: number = 50): Dead
           )
         ORDER BY f.path, s.line_start
         LIMIT ?
-    `);
-    return stmt.all(limit) as DeadExportResult[];
+    `).all(limit) as DeadExportResult[];
 }
 
 export interface PkgUsageResult {
@@ -583,14 +605,13 @@ export interface PkgUsageResult {
 
 /** Find all files that import from a given package */
 export function getPkgUsages(db: Database.Database, packageName: string): PkgUsageResult[] {
-    const stmt = db.prepare(`
+    return cached(db, `
         SELECT f.path as file, pd.imported_names as importedNames
         FROM pkg_deps pd
         JOIN files f ON f.id = pd.file_id
         WHERE pd.package = ? OR pd.package LIKE ? || '/%'
         ORDER BY f.path
-    `);
-    return stmt.all(packageName, packageName) as PkgUsageResult[];
+    `).all(packageName, packageName) as PkgUsageResult[];
 }
 
 // --- review_diff types ---
@@ -741,7 +762,7 @@ function matchHunksToSymbols(
     db: Database.Database,
     diffFile: DiffFile
 ): { changed: ChangedSymbol[]; unchangedExports: string[] } {
-    const allSymbols = db.prepare(`
+    const allSymbols = cached(db, `
         SELECT s.name, s.qualified_name, s.kind, f.path as file,
                s.line_start, s.line_end, s.signature, s.exported,
                COALESCE(r.pagerank, 0) as pagerank
@@ -811,10 +832,10 @@ function matchHunksToSymbols(
 }
 
 function getMedianPagerank(db: Database.Database): number {
-    const count = (db.prepare('SELECT COUNT(*) as cnt FROM rankings').get() as any)?.cnt || 0;
+    const count = (cached(db, 'SELECT COUNT(*) as cnt FROM rankings').get() as any)?.cnt || 0;
     if (count === 0) return 0;
     const mid = Math.floor(count / 2);
-    const row = db.prepare('SELECT pagerank FROM rankings ORDER BY pagerank LIMIT 1 OFFSET ?').get(mid) as any;
+    const row = cached(db, 'SELECT pagerank FROM rankings ORDER BY pagerank LIMIT 1 OFFSET ?').get(mid) as any;
     return row?.pagerank || 0;
 }
 
@@ -1410,12 +1431,13 @@ export function transparentReview(
                 if (seenCallers.has(key)) continue;
                 seenCallers.add(key);
 
-                // Get the caller's actual code so we can show context
-                let callerCode: string | null = null;
-                const callerCtx = getContext(db, caller.qualifiedName || caller.name);
-                if (callerCtx) {
-                    callerCode = callerCtx.symbol.code;
-                }
+                // Get just the caller's code (1 query, not 4 via getContext)
+                const callerRow = cached(db, `
+                    SELECT s.content as code FROM symbols s
+                    WHERE s.name = ? OR s.qualified_name = ?
+                    ORDER BY s.exported DESC LIMIT 1
+                `).get(caller.qualifiedName || caller.name, caller.qualifiedName || caller.name) as any;
+                const callerCode: string | null = callerRow?.code || null;
 
                 callerStories.push({
                     callerName: caller.qualifiedName || caller.name,

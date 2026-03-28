@@ -27,25 +27,32 @@ export async function startWatcher(
         awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
     });
 
-    const debounceMap = new Map<string, NodeJS.Timeout>();
+    // Batch debounce: collect changed files, reindex in one burst
+    const pendingFiles = new Set<string>();
+    let batchTimeout: NodeJS.Timeout | null = null;
+    const BATCH_DELAY = 300; // ms — wait for burst of saves to settle
 
-    function handleChange(fullPath: string) {
-        const relPath = path.relative(rootDir, fullPath);
-        if (!isSupportedFile(relPath)) return;
-
-        // Debounce 200ms per file
-        const existing = debounceMap.get(relPath);
-        if (existing) clearTimeout(existing);
-
-        debounceMap.set(relPath, setTimeout(() => {
-            debounceMap.delete(relPath);
+    function flushBatch() {
+        batchTimeout = null;
+        const files = [...pendingFiles];
+        pendingFiles.clear();
+        for (const relPath of files) {
             try {
                 reindexFile(rootDir, relPath, db);
                 onReindex?.(relPath);
             } catch (err) {
                 process.stderr.write(`[codex] reindex error ${relPath}: ${err}\n`);
             }
-        }, 200));
+        }
+    }
+
+    function handleChange(fullPath: string) {
+        const relPath = path.relative(rootDir, fullPath);
+        if (!isSupportedFile(relPath)) return;
+
+        pendingFiles.add(relPath);
+        if (batchTimeout) clearTimeout(batchTimeout);
+        batchTimeout = setTimeout(flushBatch, BATCH_DELAY);
     }
 
     function handleDelete(fullPath: string) {

@@ -71,7 +71,17 @@ const FTS_SQL = `
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name, qualified_name, signature, docstring, content,
     content='symbols', content_rowid='id',
-    tokenize='porter unicode61'
+    tokenize='porter unicode61',
+    prefix='2 4'
+);
+`;
+
+const TRIGRAM_SQL = `
+CREATE VIRTUAL TABLE IF NOT EXISTS symbols_trigram USING fts5(
+    name, qualified_name, signature,
+    content='symbols', content_rowid='id',
+    tokenize='trigram',
+    detail='none'
 );
 `;
 
@@ -79,11 +89,15 @@ const TRIGGERS_SQL = `
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
     INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, content)
     VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.content);
+    INSERT INTO symbols_trigram(rowid, name, qualified_name, signature)
+    VALUES (new.id, new.name, new.qualified_name, new.signature);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
     INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, content)
     VALUES('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.content);
+    INSERT INTO symbols_trigram(symbols_trigram, rowid, name, qualified_name, signature)
+    VALUES('delete', old.id, old.name, old.qualified_name, old.signature);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
@@ -91,6 +105,10 @@ CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
     VALUES('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.content);
     INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, content)
     VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.content);
+    INSERT INTO symbols_trigram(symbols_trigram, rowid, name, qualified_name, signature)
+    VALUES('delete', old.id, old.name, old.qualified_name, old.signature);
+    INSERT INTO symbols_trigram(rowid, name, qualified_name, signature)
+    VALUES (new.id, new.name, new.qualified_name, new.signature);
 END;
 `;
 
@@ -109,6 +127,11 @@ CREATE INDEX IF NOT EXISTS idx_pkg_deps_package ON pkg_deps(package);
 CREATE INDEX IF NOT EXISTS idx_pkg_deps_file ON pkg_deps(file_id);
 CREATE INDEX IF NOT EXISTS idx_type_relations_parent ON type_relations(parent_name);
 CREATE INDEX IF NOT EXISTS idx_type_relations_child ON type_relations(child_id);
+CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+CREATE INDEX IF NOT EXISTS idx_symbols_file_line ON symbols(file_id, line_start);
+CREATE INDEX IF NOT EXISTS idx_file_deps_to_from ON file_deps(to_file, from_file);
+CREATE INDEX IF NOT EXISTS idx_symbols_exported_kind ON symbols(exported, kind);
+CREATE INDEX IF NOT EXISTS idx_rankings_pagerank ON rankings(pagerank DESC);
 `;
 
 const PRAGMAS = [
@@ -131,8 +154,18 @@ export function openDatabase(projectRoot: string, work?: boolean): Database.Data
 
     db.exec(SCHEMA_SQL);
     db.exec(FTS_SQL);
-    db.exec(TRIGGERS_SQL);
     db.exec(INDEXES_SQL);
+
+    // Trigram table — may fail on older SQLite without trigram tokenizer
+    try { db.exec(TRIGRAM_SQL); } catch { /* trigram tokenizer not available */ }
+
+    // Recreate triggers to include trigram sync (DROP + CREATE is safe)
+    db.exec(`
+        DROP TRIGGER IF EXISTS symbols_ai;
+        DROP TRIGGER IF EXISTS symbols_ad;
+        DROP TRIGGER IF EXISTS symbols_au;
+    `);
+    db.exec(TRIGGERS_SQL);
 
     // Migrations for existing databases
     migrateSchema(db);
@@ -207,13 +240,27 @@ export function getOrCreateFile(
     return { id: Number(result.lastInsertRowid), changed: true };
 }
 
+const clearStmts = new WeakMap<Database.Database, Database.Statement[]>();
+
 export function clearFileData(db: Database.Database, fileId: number): void {
-    db.prepare('DELETE FROM rankings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)').run(fileId);
-    db.prepare('DELETE FROM type_relations WHERE child_id IN (SELECT id FROM symbols WHERE file_id = ?)').run(fileId);
-    db.prepare('DELETE FROM edges WHERE from_id IN (SELECT id FROM symbols WHERE file_id = ?) OR to_id IN (SELECT id FROM symbols WHERE file_id = ?)').run(fileId, fileId);
-    db.prepare('DELETE FROM symbols WHERE file_id = ?').run(fileId);
-    db.prepare('DELETE FROM file_deps WHERE from_file = ?').run(fileId);
-    db.prepare('DELETE FROM pkg_deps WHERE file_id = ?').run(fileId);
+    let stmts = clearStmts.get(db);
+    if (!stmts) {
+        stmts = [
+            db.prepare('DELETE FROM rankings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?)'),
+            db.prepare('DELETE FROM type_relations WHERE child_id IN (SELECT id FROM symbols WHERE file_id = ?)'),
+            db.prepare('DELETE FROM edges WHERE from_id IN (SELECT id FROM symbols WHERE file_id = ?) OR to_id IN (SELECT id FROM symbols WHERE file_id = ?)'),
+            db.prepare('DELETE FROM symbols WHERE file_id = ?'),
+            db.prepare('DELETE FROM file_deps WHERE from_file = ?'),
+            db.prepare('DELETE FROM pkg_deps WHERE file_id = ?'),
+        ];
+        clearStmts.set(db, stmts);
+    }
+    stmts[0].run(fileId);
+    stmts[1].run(fileId);
+    stmts[2].run(fileId, fileId);
+    stmts[3].run(fileId);
+    stmts[4].run(fileId);
+    stmts[5].run(fileId);
 }
 
 export interface SymbolData {
@@ -230,8 +277,10 @@ export interface SymbolData {
     parameters?: string;  // JSON array of {name, type} pairs
 }
 
+const insertSymbolStmt = new WeakMap<Database.Database, Database.Statement>();
+
 export function insertSymbol(db: Database.Database, fileId: number, sym: SymbolData): number {
-    const stmt = db.prepare(
+    const stmt = getOrPrepare(insertSymbolStmt, db,
         `INSERT INTO symbols (name, qualified_name, kind, file_id, line_start, line_end, signature, docstring, content, content_hash, exported, parameters)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
@@ -252,17 +301,25 @@ export function insertSymbol(db: Database.Database, fileId: number, sym: SymbolD
     return Number(result.lastInsertRowid);
 }
 
+const insertEdgeStmt = new WeakMap<Database.Database, Database.Statement>();
+
 export function insertEdge(db: Database.Database, fromId: number, toId: number, kind: string, line?: number): void {
-    db.prepare('INSERT OR IGNORE INTO edges (from_id, to_id, kind, line) VALUES (?, ?, ?, ?)').run(fromId, toId, kind, line || null);
+    getOrPrepare(insertEdgeStmt, db, 'INSERT OR IGNORE INTO edges (from_id, to_id, kind, line) VALUES (?, ?, ?, ?)').run(fromId, toId, kind, line || null);
 }
+
+const insertPkgDepStmt = new WeakMap<Database.Database, Database.Statement>();
 
 export function insertPkgDep(db: Database.Database, fileId: number, packageName: string, importedNames: string): void {
-    db.prepare('INSERT OR IGNORE INTO pkg_deps (file_id, package, imported_names) VALUES (?, ?, ?)').run(fileId, packageName, importedNames);
+    getOrPrepare(insertPkgDepStmt, db, 'INSERT OR IGNORE INTO pkg_deps (file_id, package, imported_names) VALUES (?, ?, ?)').run(fileId, packageName, importedNames);
 }
 
+const insertTypeRelationStmt = new WeakMap<Database.Database, Database.Statement>();
+
 export function insertTypeRelation(db: Database.Database, childId: number, parentName: string, kind: string): void {
-    db.prepare('INSERT OR IGNORE INTO type_relations (child_id, parent_name, kind) VALUES (?, ?, ?)').run(childId, parentName, kind);
+    getOrPrepare(insertTypeRelationStmt, db, 'INSERT OR IGNORE INTO type_relations (child_id, parent_name, kind) VALUES (?, ?, ?)').run(childId, parentName, kind);
 }
+
+const insertFileDepStmt = new WeakMap<Database.Database, Database.Statement>();
 
 export function insertFileDep(
     db: Database.Database,
@@ -271,9 +328,7 @@ export function insertFileDep(
     kind: string,
     importName: string
 ): void {
-    db.prepare(
-        'INSERT OR IGNORE INTO file_deps (from_file, to_file, kind, import_name) VALUES (?, ?, ?, ?)'
-    ).run(fromFile, toFile, kind, importName);
+    getOrPrepare(insertFileDepStmt, db, 'INSERT OR IGNORE INTO file_deps (from_file, to_file, kind, import_name) VALUES (?, ?, ?, ?)').run(fromFile, toFile, kind, importName);
 }
 
 export function removeStaleFiles(db: Database.Database, validPaths: Set<string>): number {
