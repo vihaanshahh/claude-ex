@@ -21,7 +21,66 @@ That's it. Open Claude Code — the MCP server starts automatically and gives Cl
 2. **Computes PageRank** to identify structurally important symbols
 3. **Runs as MCP server** with the SQLite database held open in memory — every query answers in <5ms
 4. **Watches files** for changes and reindexes in <15ms
-5. **Hooks into Claude Code** to inject context before/after edits
+5. **Generates CLAUDE.md** with a development cycle that Claude follows automatically
+
+## What's New in 1.4.0
+
+### Performance Overhaul
+
+Every query is now faster. The entire engine was rewritten for speed:
+
+- **Prepared statement cache** — SQL is compiled once per db connection, not per call. Every MCP tool invocation skips recompilation.
+- **N+1 query elimination** — `getStats` (4 queries → 1), `getModules` (N+1 → 2), `getFileMap` / `getFileMapCompact` (N+1 → 1 via GROUP_CONCAT)
+- **5 new indexes** — `files(path)`, `symbols(file_id, line_start)`, `file_deps(to_file, from_file)`, `symbols(exported, kind)`, `rankings(pagerank DESC)` — eliminates full table scans in hot-path queries
+- **PageRank O(n) per iteration** — dangling node mass is pre-computed instead of O(n^2) inner loop
+- **Import resolution** — uses pre-computed file set (0 `fs.existsSync` calls) instead of 11 syscalls per import
+- **`transparentReview`** — 80 queries → 25 (lightweight code fetch instead of full `getContext` per caller)
+- **Compact JSON** — MCP responses use `JSON.stringify(result)` instead of pretty-printed (30-50% smaller, 2x faster serialization)
+- **Pre-warm on startup** — statement cache + SQLite page cache are warm before the first tool call
+
+### Trigram Search
+
+Substring and fuzzy matching, similar to Cursor's Instant Grep approach:
+
+- New `symbols_trigram` FTS5 table with `tokenize='trigram'` for substring matches on symbol names, qualified names, and signatures
+- **Two-pass search** — FTS5 word-level search first (fast, ranked), trigram fallback if results are sparse
+- **FTS5 prefix index** (`prefix='2 4'`) — 80% faster prefix/autocomplete queries
+- **NEAR phrase queries** — multi-token searches like `"get user"` use `NEAR` operator for better relevance, falling back to `OR` for partial matches
+
+### Development Cycle in CLAUDE.md
+
+The generated CLAUDE.md now includes a mandatory development cycle that Claude follows for every code change:
+
+1. **Understand** — `search_code` → `get_symbol` → `get_callers` → `get_dependents` before touching anything
+2. **Plan** — identify all affected files/symbols, state the plan if >3 files
+3. **Implement** — edit code, update all callers, `reindex_file` after major changes
+4. **Verify** — re-check callers/dependents, run tests and build
+5. **Review** — `review_diff` for graph-aware risk assessment
+
+Each step has a gate condition and a quick-reference table mapping steps to tools. Claude won't skip steps.
+
+### CLAUDE.md Generator Improvements
+
+- **Skip-if-unchanged** — won't rewrite the file if the generated section is identical (no more spurious git diffs)
+- **Marker-safe** — only replaces content between `<!-- claude-ex:start -->` and `<!-- claude-ex:end -->`, preserving all user content before and after
+- **Directive-style MCP docs** — decision guide table tells Claude exactly when to use each tool vs grep
+- **Development cycle** — enforced process section (see above)
+
+### Test Suite
+
+93 tests across 5 files, runnable via `npm test`:
+
+- **`tests/schema.test.ts`** (17) — database creation, tables, indexes, FTS, CRUD operations
+- **`tests/engine.test.ts`** (25) — search, callers, context, impact, stats, file map, type hierarchy, dead exports, package usages
+- **`tests/indexer.test.ts`** (10) — full index, file dependencies, PageRank, re-index, parser integration
+- **`tests/claudemd.test.ts`** (11) — markers, user content preservation, skip-if-unchanged, development cycle
+- **`tests/perf.test.ts`** (18) — performance gates (<50ms per query), data integrity (PageRank sum, no orphans, FTS sync)
+
+### Other Improvements
+
+- **Batch watcher debounce** — burst of file saves → single reindex batch (300ms window)
+- **Memoized tool list** — MCP `ListTools` response allocated once, not per request
+- **Cached insert statements** — `insertSymbol`, `insertEdge`, `insertPkgDep`, etc. use WeakMap-cached prepared statements
 
 ## Transparent Review (`transparent_review`)
 
@@ -125,24 +184,25 @@ In Claude Code, type:
    - Cross-file concerns
    - Verdict + action items
 
-### When it helps most
-
-- Multi-file refactors — catches "you changed X but 12 callers need updates"
-- Exported API changes — flags widely-used exports that were modified
-- Large PRs — risk signals help prioritize what to look at
-- Deleted files — warns if something still imports from them
-
 ## MCP Tools
 
 | Tool | What it does | Speed |
 |------|-------------|-------|
-| `search_code` | Hybrid FTS5 + PageRank search | 1-3ms |
-| `get_symbol` | Full context for a symbol | 2-4ms |
-| `get_callers` | Who calls this function | 1-3ms |
-| `get_dependents` | What breaks if a file changes | 2-5ms |
-| `get_dependencies` | What a symbol depends on | 1-3ms |
-| `get_architecture` | Project overview | 3-5ms |
-| `review_diff` | Graph-aware diff review context (structured JSON) | 10-50ms |
+| `search_code` | Hybrid FTS5 + trigram + PageRank search | <3ms |
+| `get_symbol` | Full context for a symbol | <4ms |
+| `get_callers` | Who calls this function | <3ms |
+| `get_dependents` | What breaks if a file changes | <5ms |
+| `get_dependencies` | What a symbol depends on | <3ms |
+| `get_file_map` | Every file and its exports | <5ms |
+| `get_file_symbols` | All symbols in a file | <3ms |
+| `find_files` | Find files by glob pattern | <3ms |
+| `find_by_kind` | All classes, interfaces, enums, etc. | <5ms |
+| `get_type_hierarchy` | Subclasses/implementors | <3ms |
+| `find_dead_exports` | Exported symbols nothing imports | <10ms |
+| `get_pkg_usages` | Files importing a given package | <3ms |
+| `get_architecture` | Project overview | <5ms |
+| `reindex_file` | Re-index after edits | <15ms |
+| `review_diff` | Graph-aware diff review (structured JSON) | 10-50ms |
 | `transparent_review` | Zero-black-box review narrative (readable English) | 15-80ms |
 
 ## CLI Commands
@@ -165,6 +225,14 @@ claude-ex post-edit <file>             Post-edit reindex (PostToolUse hook)
 claude-ex generate-docs                Regenerate CLAUDE.md
 claude-ex mcp                          Run as MCP server
 claude-ex uninstall                    Remove all config
+```
+
+## Testing
+
+```bash
+npm test              Run all 93 tests
+npm run test:watch    Watch mode
+npm run prepush       Build + test (pre-push validation)
 ```
 
 ## Supported Languages
