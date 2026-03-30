@@ -146,31 +146,50 @@ const PRAGMAS = [
 export function openDatabase(projectRoot: string, work?: boolean): Database.Database {
     const codexDir = work !== undefined ? ensureCodexDir(projectRoot, work) : ensureCodexDir(projectRoot);
     const dbPath = path.join(codexDir, 'index.db');
-    const db = new Database(dbPath);
 
-    for (const pragma of PRAGMAS) {
-        db.pragma(pragma.replace('PRAGMA ', ''));
+    function initDb(): Database.Database {
+        const db = new Database(dbPath);
+
+        for (const pragma of PRAGMAS) {
+            db.pragma(pragma.replace('PRAGMA ', ''));
+        }
+
+        db.exec(SCHEMA_SQL);
+        db.exec(FTS_SQL);
+        db.exec(INDEXES_SQL);
+
+        // Trigram table — may fail on older SQLite without trigram tokenizer
+        try { db.exec(TRIGRAM_SQL); } catch { /* trigram tokenizer not available */ }
+
+        // Recreate triggers to include trigram sync (DROP + CREATE is safe)
+        db.exec(`
+            DROP TRIGGER IF EXISTS symbols_ai;
+            DROP TRIGGER IF EXISTS symbols_ad;
+            DROP TRIGGER IF EXISTS symbols_au;
+        `);
+        db.exec(TRIGGERS_SQL);
+
+        // Migrations for existing databases
+        migrateSchema(db);
+
+        return db;
     }
 
-    db.exec(SCHEMA_SQL);
-    db.exec(FTS_SQL);
-    db.exec(INDEXES_SQL);
-
-    // Trigram table — may fail on older SQLite without trigram tokenizer
-    try { db.exec(TRIGRAM_SQL); } catch { /* trigram tokenizer not available */ }
-
-    // Recreate triggers to include trigram sync (DROP + CREATE is safe)
-    db.exec(`
-        DROP TRIGGER IF EXISTS symbols_ai;
-        DROP TRIGGER IF EXISTS symbols_ad;
-        DROP TRIGGER IF EXISTS symbols_au;
-    `);
-    db.exec(TRIGGERS_SQL);
-
-    // Migrations for existing databases
-    migrateSchema(db);
-
-    return db;
+    try {
+        return initDb();
+    } catch (err: unknown) {
+        const code = (err as { code?: string }).code ?? '';
+        if (code.startsWith('SQLITE_CORRUPT')) {
+            // Database is corrupted — delete and recreate from scratch
+            try { fs.unlinkSync(dbPath); } catch { /* already gone */ }
+            // Also remove WAL/SHM sidecar files
+            try { fs.unlinkSync(dbPath + '-wal'); } catch { /* ok */ }
+            try { fs.unlinkSync(dbPath + '-shm'); } catch { /* ok */ }
+            process.stderr.write(`Warning: corrupted index database deleted, rebuilding...\n`);
+            return initDb();
+        }
+        throw err;
+    }
 }
 
 function migrateSchema(db: Database.Database): void {
