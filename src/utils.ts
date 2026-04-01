@@ -47,3 +47,11 @@ export function truncate(str: string, maxLen: number): string {
     if (str.length <= maxLen) return str;
     return str.slice(0, maxLen) + '...';
 }
+
+export function countLines(content: string): number {
+    let count = 1;
+    for (let i = 0; i < content.length; i++) {
+        if (content.charCodeAt(i) === 10) count++;
+    }
+    return count;
+}

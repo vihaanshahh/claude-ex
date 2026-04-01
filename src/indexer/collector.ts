@@ -35,7 +35,7 @@ const SUPPORTED_EXTENSIONS = new Set([
     '.html', '.htm',
 ]);
 
-const MAX_FILE_SIZE = 512 * 1024; // 512KB
+export const MAX_FILE_SIZE = 512 * 1024; // 512KB
 
 function parseGitignore(rootDir: string): Set<string> {
     const ignored = new Set<string>();
@@ -81,15 +81,7 @@ export function collectFiles(rootDir: string): string[] {
                 if (SKIP_EXTENSIONS.has(ext)) continue;
                 if (!SUPPORTED_EXTENSIONS.has(ext)) continue;
 
-                const fullPath = path.join(dir, name);
-                try {
-                    const stat = fs.statSync(fullPath);
-                    if (stat.size > MAX_FILE_SIZE) continue;
-                } catch {
-                    continue;
-                }
-
-                files.push(path.relative(rootDir, fullPath));
+                files.push(path.relative(rootDir, path.join(dir, name)));
             }
         }
     }

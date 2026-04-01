@@ -6,8 +6,9 @@ import {
     insertSymbol, insertEdge, insertFileDep, insertPkgDep, insertTypeRelation,
     removeStaleFiles, removeFile
 } from '../db/schema';
-import { collectFiles } from './collector';
+import { collectFiles, MAX_FILE_SIZE } from './collector';
 import { parseFile, hashFile, getLanguage } from './parser';
+import { countLines } from '../utils';
 
 export interface IndexStats {
     totalFiles: number;
@@ -79,6 +80,8 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
     // Track file -> symbol IDs and file -> imported file paths
     const fileSymbolMap = new Map<string, Map<string, number>>(); // filePath -> (symbolName -> symbolId)
     const fileImportMap = new Map<string, { resolved: string; names: string[] }[]>();
+    // Track which symbols call a given name per file: "filePath:calledName" -> Set<callerId>
+    const callTargetToCallers = new Map<string, Set<number>>();
     const validPaths = new Set(files);
 
     const lookupFileStmt = db.prepare('SELECT id FROM files WHERE path = ?');
@@ -86,12 +89,28 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
         'SELECT id, name, qualified_name, exported FROM symbols WHERE file_id = ?'
     );
 
+    // Pre-read all files and create file records so import resolution works
+    // regardless of alphabetical processing order.
+    interface FileInfo {
+        relPath: string;
+        content: string;
+        fileId: number;
+        changed: boolean;
+    }
+    const fileInfos: FileInfo[] = [];
+
     const transaction = db.transaction(() => {
+        // Pass 1: create/update all file records
         for (const relPath of files) {
             const fullPath = path.join(rootDir, relPath);
             let content: string;
             try {
-                content = fs.readFileSync(fullPath, 'utf-8');
+                const buf = fs.readFileSync(fullPath);
+                if (buf.length > MAX_FILE_SIZE) {
+                    skippedFiles++;
+                    continue;
+                }
+                content = buf.toString('utf-8');
             } catch {
                 skippedFiles++;
                 continue;
@@ -99,14 +118,18 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
 
             const hash = hashFile(content);
             const language = getLanguage(relPath);
-            const lineCount = content.split('\n').length;
+            const lineCount = countLines(content);
             const mtime = getFileMtime(fullPath);
             const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount, mtime);
+            fileInfos.push({ relPath, content, fileId: fileRecord.id, changed: fileRecord.changed });
+        }
 
-            if (!fileRecord.changed) {
+        // Pass 2: parse changed files, resolve imports (all file records now exist)
+        for (const { relPath, content, fileId, changed } of fileInfos) {
+            if (!changed) {
                 skippedFiles++;
                 // Still need to track existing symbols for cross-file resolution
-                const existingSymbols = lookupExistingSymsStmt.all(fileRecord.id) as { id: number; name: string; qualified_name: string | null; exported: number }[];
+                const existingSymbols = lookupExistingSymsStmt.all(fileId) as { id: number; name: string; qualified_name: string | null; exported: number }[];
                 const symbolMap = new Map<string, number>();
                 for (const s of existingSymbols) {
                     if (s.exported) {
@@ -118,13 +141,13 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
                 continue;
             }
 
-            clearFileData(db, fileRecord.id);
+            clearFileData(db, fileId);
             const parsed = parseFile(relPath, content);
 
             const symbolMap = new Map<string, number>();
 
             for (const sym of parsed.symbols) {
-                const symId = insertSymbol(db, fileRecord.id, {
+                const symId = insertSymbol(db, fileId, {
                     name: sym.name,
                     qualifiedName: sym.qualifiedName,
                     kind: sym.kind,
@@ -159,7 +182,7 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
             for (const reExport of parsed.reExports) {
                 for (const name of reExport.names) {
                     if (!symbolMap.has(name)) {
-                        const symId = insertSymbol(db, fileRecord.id, {
+                        const symId = insertSymbol(db, fileId, {
                             name,
                             kind: 'reexport',
                             lineStart: 0,
@@ -173,13 +196,13 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
                 }
             }
 
-            // Resolve imports to file paths
+            // Resolve imports to file paths — all file records exist now
             const resolvedImports: { resolved: string; names: string[] }[] = [];
             for (const imp of parsed.imports) {
                 if (isPackageImport(imp.source)) {
                     // Third-party import — store in pkg_deps
                     const names = imp.names.length > 0 ? imp.names.join(',') : imp.isDefault ? 'default' : '*';
-                    insertPkgDep(db, fileRecord.id, imp.source, names);
+                    insertPkgDep(db, fileId, imp.source, names);
                     continue;
                 }
 
@@ -188,7 +211,7 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
                     const toFile = lookupFileStmt.get(resolved) as { id: number } | undefined;
                     if (toFile) {
                         const importName = imp.names.length > 0 ? imp.names.join(',') : '*';
-                        insertFileDep(db, fileRecord.id, toFile.id, 'import', importName);
+                        insertFileDep(db, fileId, toFile.id, 'import', importName);
                     }
                     resolvedImports.push({ resolved, names: imp.names });
                 }
@@ -203,6 +226,13 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
                     insertEdge(db, callerId, calledId, 'calls', call.line);
                     totalEdges++;
                 }
+                // Track caller->calledName for cross-file edge resolution
+                if (callerId) {
+                    const key = `${relPath}:${call.calledName}`;
+                    let set = callTargetToCallers.get(key);
+                    if (!set) { set = new Set(); callTargetToCallers.set(key, set); }
+                    set.add(callerId);
+                }
             }
 
             indexedFiles++;
@@ -214,7 +244,7 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
         // Remove stale files
         removeStaleFiles(db, validPaths);
 
-        // Cross-file edge resolution
+        // Cross-file edge resolution — only link symbols that actually use the import
         for (const [filePath, resolvedImports] of fileImportMap) {
             const importingSymbols = fileSymbolMap.get(filePath);
             if (!importingSymbols) continue;
@@ -225,13 +255,29 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
 
                 for (const importedName of imp.names) {
                     const targetId = exportedSymbols.get(importedName);
-                    if (targetId) {
-                        // Create REFERENCES edges from all symbols in importing file to imported symbol
-                        for (const [, srcId] of importingSymbols) {
-                            if (srcId !== targetId) {
-                                insertEdge(db, srcId, targetId, 'references');
+                    if (!targetId) continue;
+
+                    // Check if any intra-file call already references this name
+                    // (calls from parser track calledName which may match importedName)
+                    let linked = false;
+                    const callerIds = callTargetToCallers.get(`${filePath}:${importedName}`);
+                    if (callerIds) {
+                        for (const callerId of callerIds) {
+                            if (callerId !== targetId) {
+                                insertEdge(db, callerId, targetId, 'references');
                                 totalEdges++;
+                                linked = true;
                             }
+                        }
+                    }
+
+                    // Fallback: if no specific caller found, create one edge from
+                    // the first symbol in the file (preserves PageRank connectivity)
+                    if (!linked) {
+                        const firstId = importingSymbols.values().next().value;
+                        if (firstId && firstId !== targetId) {
+                            insertEdge(db, firstId, targetId, 'references');
+                            totalEdges++;
                         }
                     }
                 }
@@ -278,7 +324,7 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
 
     const hash = hashFile(content);
     const language = getLanguage(relPath);
-    const lineCount = content.split('\n').length;
+    const lineCount = countLines(content);
     const mtime = getFileMtime(fullPath);
     const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount, mtime);
 
@@ -289,6 +335,7 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
 
     clearFileData(db, fileRecord.id);
     const parsed = parseFile(relPath, content);
+    const lookupFileByPath = db.prepare('SELECT id FROM files WHERE path = ?');
 
     const symbolMap = new Map<string, number>();
     for (const sym of parsed.symbols) {
@@ -347,7 +394,7 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
 
         const resolved = resolveImportPath(rootDir, relPath, imp.source);
         if (resolved) {
-            const toFile = db.prepare('SELECT id FROM files WHERE path = ?').get(resolved) as { id: number } | undefined;  // reindexFile: single file, not hot loop
+            const toFile = lookupFileByPath.get(resolved) as { id: number } | undefined;
             if (toFile) {
                 insertFileDep(db, fileRecord.id, toFile.id, 'import', imp.names.join(',') || '*');
             }
