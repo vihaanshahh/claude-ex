@@ -352,11 +352,12 @@ export function insertFileDep(
 
 export function removeStaleFiles(db: Database.Database, validPaths: Set<string>): number {
     const allFiles = db.prepare('SELECT id, path FROM files').all() as { id: number; path: string }[];
+    const deleteStmt = db.prepare('DELETE FROM files WHERE id = ?');
     let removed = 0;
     for (const file of allFiles) {
         if (!validPaths.has(file.path)) {
             clearFileData(db, file.id);
-            db.prepare('DELETE FROM files WHERE id = ?').run(file.id);
+            deleteStmt.run(file.id);
             removed++;
         }
     }
