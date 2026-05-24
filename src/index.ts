@@ -45,11 +45,13 @@ program
     .argument('[path]', 'Project directory')
     .option('-v, --verbose', 'Verbose output')
     .option('-w, --work', 'Work mode: store data in .local/ and gitignore all config (nothing committed)')
+    .option('--codex', 'Also register the MCP server with Codex and generate AGENTS.md')
     .description('Index project + install Claude Code config + generate docs')
     .action((pathArg, opts) => {
         const rootDir = resolveRoot(pathArg);
         const dirname = path.basename(rootDir);
         const work = !!opts.work;
+        const codex = !!opts.codex;
 
         console.log(`Indexing ${dirname}...${work ? ' (work mode — .local/)' : ''}`);
         const stats = indexProject(rootDir, { verbose: opts.verbose, work });
@@ -58,7 +60,10 @@ program
         console.log(`  ${stats.symbols} symbols, ${stats.edges} edges`);
 
         console.log('Installing Claude Code config...');
-        install(rootDir, { work });
+        if (codex) {
+            console.log('Registering Codex MCP config...');
+        }
+        install(rootDir, { work, codex });
 
         if (!work) {
             console.log('Generating CLAUDE.md...');
@@ -70,8 +75,11 @@ program
         console.log('');
         console.log('Setup complete! MCP server will start automatically when you open Claude Code.');
         console.log('Hooks installed: SessionStart, PreToolUse (Write/Edit), PostToolUse (Write/Edit)');
+        if (codex) {
+            console.log('Codex setup complete: registered MCP server "claude-ex" and updated AGENTS.md.');
+        }
         if (work) {
-            console.log('Work mode: .local/, .claude/, .mcp.json are gitignored — nothing committed.');
+            console.log(`Work mode: .local/, .claude/, .mcp.json${codex ? ', AGENTS.md' : ''} are gitignored — nothing committed.`);
         }
     });
 
@@ -94,7 +102,7 @@ program
     .description('Re-index a single file')
     .action((file) => {
         const rootDir = requireIndex();
-        reindexFile(rootDir, file);
+        reindexFile(rootDir, file, undefined, { force: true });
     });
 
 // --- search ---
@@ -284,9 +292,11 @@ daemon
 // --- mcp ---
 program
     .command('mcp')
+    .argument('[path]', 'Project directory')
+    .option('--no-watch', 'Disable the MCP file watcher')
     .description('Run as MCP server (stdio, long-lived)')
-    .action(async () => {
-        await runMcpServer();
+    .action(async (pathArg, opts) => {
+        await runMcpServer(pathArg, { watch: opts.watch });
     });
 
 // --- uninstall ---

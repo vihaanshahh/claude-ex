@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import {
     openDatabase, getOrCreateFile, clearFileData,
     insertSymbol, insertEdge, insertFileDep, insertPkgDep, insertTypeRelation,
-    removeStaleFiles, removeFile
+    removeStaleFiles, removeFile, isSqliteCorruptionError, resetDatabaseFiles
 } from '../db/schema';
 import { collectFiles } from './collector';
 import { parseFile, hashFile, getLanguage } from './parser';
@@ -66,6 +66,17 @@ function getFileMtime(fullPath: string): number | undefined {
 }
 
 export function indexProject(rootDir: string, options?: { verbose?: boolean; work?: boolean }): IndexStats {
+    try {
+        return indexProjectOnce(rootDir, options);
+    } catch (err) {
+        if (!isSqliteCorruptionError(err)) throw err;
+        resetDatabaseFiles(rootDir, options?.work);
+        process.stderr.write('Warning: corrupted index database detected during indexing, rebuilding from scratch...\n');
+        return indexProjectOnce(rootDir, options);
+    }
+}
+
+function indexProjectOnce(rootDir: string, options?: { verbose?: boolean; work?: boolean }): IndexStats {
     const start = performance.now();
     const db = openDatabase(rootDir, options?.work);
     const files = collectFiles(rootDir);
@@ -79,14 +90,20 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
     // Track file -> symbol IDs and file -> imported file paths
     const fileSymbolMap = new Map<string, Map<string, number>>(); // filePath -> (symbolName -> symbolId)
     const fileImportMap = new Map<string, { resolved: string; names: string[] }[]>();
+    const fileIds = new Map<string, number>();
     const validPaths = new Set(files);
 
-    const lookupFileStmt = db.prepare('SELECT id FROM files WHERE path = ?');
     const lookupExistingSymsStmt = db.prepare(
         'SELECT id, name, qualified_name, exported FROM symbols WHERE file_id = ?'
     );
 
     const transaction = db.transaction(() => {
+        const changedFiles: {
+            relPath: string;
+            content: string;
+            fileId: number;
+        }[] = [];
+
         for (const relPath of files) {
             const fullPath = path.join(rootDir, relPath);
             let content: string;
@@ -102,6 +119,7 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
             const lineCount = content.split('\n').length;
             const mtime = getFileMtime(fullPath);
             const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount, mtime);
+            fileIds.set(relPath, fileRecord.id);
 
             if (!fileRecord.changed) {
                 skippedFiles++;
@@ -118,13 +136,19 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
                 continue;
             }
 
-            clearFileData(db, fileRecord.id);
+            changedFiles.push({ relPath, content, fileId: fileRecord.id });
+        }
+
+        for (const changedFile of changedFiles) {
+            const { relPath, content, fileId } = changedFile;
+
+            clearFileData(db, fileId);
             const parsed = parseFile(relPath, content);
 
             const symbolMap = new Map<string, number>();
 
             for (const sym of parsed.symbols) {
-                const symId = insertSymbol(db, fileRecord.id, {
+                const symId = insertSymbol(db, fileId, {
                     name: sym.name,
                     qualifiedName: sym.qualifiedName,
                     kind: sym.kind,
@@ -159,7 +183,7 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
             for (const reExport of parsed.reExports) {
                 for (const name of reExport.names) {
                     if (!symbolMap.has(name)) {
-                        const symId = insertSymbol(db, fileRecord.id, {
+                        const symId = insertSymbol(db, fileId, {
                             name,
                             kind: 'reexport',
                             lineStart: 0,
@@ -179,16 +203,16 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
                 if (isPackageImport(imp.source)) {
                     // Third-party import — store in pkg_deps
                     const names = imp.names.length > 0 ? imp.names.join(',') : imp.isDefault ? 'default' : '*';
-                    insertPkgDep(db, fileRecord.id, imp.source, names);
+                    insertPkgDep(db, fileId, imp.source, names);
                     continue;
                 }
 
                 const resolved = resolveImportPath(rootDir, relPath, imp.source, validPaths);
                 if (resolved) {
-                    const toFile = lookupFileStmt.get(resolved) as { id: number } | undefined;
-                    if (toFile) {
+                    const toFileId = fileIds.get(resolved);
+                    if (toFileId) {
                         const importName = imp.names.length > 0 ? imp.names.join(',') : '*';
-                        insertFileDep(db, fileRecord.id, toFile.id, 'import', importName);
+                        insertFileDep(db, fileId, toFileId, 'import', importName);
                     }
                     resolvedImports.push({ resolved, names: imp.names });
                 }
@@ -256,7 +280,23 @@ export function indexProject(rootDir: string, options?: { verbose?: boolean; wor
     };
 }
 
-export function reindexFile(rootDir: string, relPath: string, db?: Database.Database): void {
+export interface ReindexFileOptions {
+    force?: boolean;
+}
+
+export function reindexFile(rootDir: string, relPath: string, db?: Database.Database, options?: ReindexFileOptions): void {
+    try {
+        reindexFileOnce(rootDir, relPath, db, options);
+    } catch (err) {
+        if (!isSqliteCorruptionError(err)) throw err;
+        if (db) throw err;
+        resetDatabaseFiles(rootDir);
+        process.stderr.write(`Warning: corrupted index database detected while reindexing ${relPath}, rebuilding...\n`);
+        indexProject(rootDir);
+    }
+}
+
+function reindexFileOnce(rootDir: string, relPath: string, db?: Database.Database, options?: ReindexFileOptions): void {
     const shouldClose = !db;
     if (!db) db = openDatabase(rootDir);
 
@@ -282,7 +322,7 @@ export function reindexFile(rootDir: string, relPath: string, db?: Database.Data
     const mtime = getFileMtime(fullPath);
     const fileRecord = getOrCreateFile(db, relPath, hash, language, lineCount, mtime);
 
-    if (!fileRecord.changed) {
+    if (!fileRecord.changed && !options?.force) {
         if (shouldClose) db.close();
         return;
     }

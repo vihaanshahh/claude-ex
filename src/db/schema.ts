@@ -3,6 +3,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { ensureCodexDir, getCodexDir } from '../utils';
 
+const SCHEMA_VERSION = 2;
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,11 +114,32 @@ CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
 END;
 `;
 
+const FTS_ONLY_TRIGGERS_SQL = `
+CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, content)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, content)
+    VALUES('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring, content)
+    VALUES('delete', old.id, old.name, old.qualified_name, old.signature, old.docstring, old.content);
+    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring, content)
+    VALUES (new.id, new.name, new.qualified_name, new.signature, new.docstring, new.content);
+END;
+`;
+
 const INDEXES_SQL = `
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_qualified_nocase ON symbols(qualified_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_symbols_exported ON symbols(exported, file_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id, kind);
@@ -149,6 +172,7 @@ export function openDatabase(projectRoot: string, work?: boolean): Database.Data
 
     function initDb(): Database.Database {
         const db = new Database(dbPath);
+        const schemaVersion = db.pragma('user_version', { simple: true }) as number;
 
         for (const pragma of PRAGMAS) {
             db.pragma(pragma.replace('PRAGMA ', ''));
@@ -159,18 +183,23 @@ export function openDatabase(projectRoot: string, work?: boolean): Database.Data
         db.exec(INDEXES_SQL);
 
         // Trigram table — may fail on older SQLite without trigram tokenizer
-        try { db.exec(TRIGRAM_SQL); } catch { /* trigram tokenizer not available */ }
+        let hasTrigram = true;
+        try { db.exec(TRIGRAM_SQL); } catch { hasTrigram = false; }
 
-        // Recreate triggers to include trigram sync (DROP + CREATE is safe)
-        db.exec(`
-            DROP TRIGGER IF EXISTS symbols_ai;
-            DROP TRIGGER IF EXISTS symbols_ad;
-            DROP TRIGGER IF EXISTS symbols_au;
-        `);
-        db.exec(TRIGGERS_SQL);
+        if (schemaVersion < SCHEMA_VERSION) {
+            // Recreate triggers only during migrations; doing this on every open slows
+            // CLI/MCP startup and can fail when callers only need a read query.
+            db.exec(`
+                DROP TRIGGER IF EXISTS symbols_ai;
+                DROP TRIGGER IF EXISTS symbols_ad;
+                DROP TRIGGER IF EXISTS symbols_au;
+            `);
+            db.exec(hasTrigram ? TRIGGERS_SQL : FTS_ONLY_TRIGGERS_SQL);
 
-        // Migrations for existing databases
-        migrateSchema(db);
+            // Migrations for existing databases
+            migrateSchema(db);
+            db.pragma(`user_version = ${SCHEMA_VERSION}`);
+        }
 
         return db;
     }
@@ -179,17 +208,27 @@ export function openDatabase(projectRoot: string, work?: boolean): Database.Data
         return initDb();
     } catch (err: unknown) {
         const code = (err as { code?: string }).code ?? '';
-        if (code.startsWith('SQLITE_CORRUPT')) {
+        if (isSqliteCorruptionError(err)) {
             // Database is corrupted — delete and recreate from scratch
-            try { fs.unlinkSync(dbPath); } catch { /* already gone */ }
-            // Also remove WAL/SHM sidecar files
-            try { fs.unlinkSync(dbPath + '-wal'); } catch { /* ok */ }
-            try { fs.unlinkSync(dbPath + '-shm'); } catch { /* ok */ }
+            resetDatabaseFiles(projectRoot, work);
             process.stderr.write(`Warning: corrupted index database deleted, rebuilding...\n`);
             return initDb();
         }
         throw err;
     }
+}
+
+export function isSqliteCorruptionError(err: unknown): boolean {
+    const code = (err as { code?: string }).code ?? '';
+    return code.startsWith('SQLITE_CORRUPT');
+}
+
+export function resetDatabaseFiles(projectRoot: string, work?: boolean): void {
+    const codexDir = work !== undefined ? ensureCodexDir(projectRoot, work) : getCodexDir(projectRoot);
+    const dbPath = path.join(codexDir, 'index.db');
+    try { fs.unlinkSync(dbPath); } catch { /* already gone */ }
+    try { fs.unlinkSync(dbPath + '-wal'); } catch { /* ok */ }
+    try { fs.unlinkSync(dbPath + '-shm'); } catch { /* ok */ }
 }
 
 function migrateSchema(db: Database.Database): void {

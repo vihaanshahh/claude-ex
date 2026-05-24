@@ -4,19 +4,129 @@ import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import * as fs from 'fs';
+import * as path from 'path';
 import { openDatabase } from '../db/schema';
 import { findProjectRoot } from '../utils';
 import { startWatcher } from '../watcher/daemon';
 import {
     search, getCallers, getContext, getImpact,
     getDeps, getRank, getModules, getStats, findFiles, getFileMap,
-    getFileSymbols, findByKind, getTypeHierarchy, findDeadExports, getPkgUsages,
+    getFileSymbols, getFileContext, getTaskContext, findByKind, getTypeHierarchy, findDeadExports, getPkgUsages,
     reviewDiff, transparentReview,
 } from '../query/engine';
-import { reindexFile } from '../indexer';
+import { indexProject, reindexFile } from '../indexer';
+import { collectFiles } from '../indexer/collector';
+import { getLanguage, parseFile } from '../indexer/parser';
 
-export async function runMcpServer(): Promise<void> {
-    const rootDir = findProjectRoot() || process.env.CODEX_ROOT || process.cwd();
+function resolveMcpRoot(pathArg?: string): string {
+    const explicitRoot = pathArg || process.env.CLAUDE_EX_ROOT || process.env.CODEX_ROOT;
+    if (explicitRoot) {
+        const resolved = path.resolve(explicitRoot);
+        return findProjectRoot(resolved) || resolved;
+    }
+
+    return findProjectRoot() || process.cwd();
+}
+
+function normalizeFileArg(rootDir: string, fileArg: unknown): string {
+    if (typeof fileArg !== 'string') return '';
+
+    let filePath = fileArg.trim();
+    if (filePath.startsWith('file://')) {
+        try {
+            filePath = new URL(filePath).pathname;
+        } catch {
+            // Keep the original value and let normal path handling deal with it.
+        }
+    }
+
+    filePath = filePath.replace(/\\/g, '/');
+    const relPath = path.isAbsolute(filePath)
+        ? path.relative(rootDir, filePath)
+        : filePath;
+
+    return path.normalize(relPath).replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function normalizeFileList(rootDir: string, fileArgs: unknown): string[] {
+    const values = Array.isArray(fileArgs) ? fileArgs : [fileArgs];
+    return [...new Set(values
+        .map(file => normalizeFileArg(rootDir, file))
+        .filter(Boolean))];
+}
+
+function resolveInsideRoot(rootDir: string, relPath: string): string | null {
+    if (!relPath || relPath === '.') return null;
+    const fullPath = path.resolve(rootDir, relPath);
+    const relative = path.relative(rootDir, fullPath);
+    if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    return fullPath;
+}
+
+function fileExists(rootDir: string, relPath: string): boolean {
+    const fullPath = resolveInsideRoot(rootDir, relPath);
+    return !!fullPath && fs.existsSync(fullPath);
+}
+
+function readLiveFileSymbols(rootDir: string, relPath: string): any[] {
+    const fullPath = resolveInsideRoot(rootDir, relPath);
+    if (!fullPath) return [];
+
+    try {
+        const content = fs.readFileSync(fullPath, 'utf-8');
+        return parseFile(relPath, content).symbols.map(sym => ({
+            name: sym.name,
+            qualifiedName: sym.qualifiedName ?? null,
+            kind: sym.kind,
+            lineStart: sym.lineStart,
+            lineEnd: sym.lineEnd,
+            signature: sym.signature ?? null,
+            exported: !!sym.exported,
+            parameters: sym.parameters ? JSON.stringify(sym.parameters) : null,
+        }));
+    } catch {
+        return [];
+    }
+}
+
+function hasIndexableCode(rootDir: string): boolean {
+    return collectFiles(rootDir).some(file => {
+        const language = getLanguage(file);
+        return !!language && !['json', 'css', 'html'].includes(language);
+    });
+}
+
+function needsIndexRecovery(rootDir: string, stats: ReturnType<typeof getStats>): boolean {
+    if (stats.files === 0) return collectFiles(rootDir).length > 0;
+    if (stats.symbols === 0) return hasIndexableCode(rootDir);
+    return false;
+}
+
+function latestSourceMtime(rootDir: string, files: string[]): number {
+    let latest = 0;
+    for (const file of files) {
+        try {
+            const mtime = fs.statSync(path.join(rootDir, file)).mtimeMs;
+            if (mtime > latest) latest = mtime;
+        } catch {
+            // Ignore files that disappeared between collection and stat.
+        }
+    }
+    return latest;
+}
+
+function indexLooksStale(rootDir: string, db: ReturnType<typeof openDatabase>, stats: ReturnType<typeof getStats>): boolean {
+    const files = collectFiles(rootDir);
+    if (files.length !== stats.files) return true;
+    if (files.length === 0) return false;
+
+    const indexed = db.prepare('SELECT COALESCE(MAX(last_modified), 0) as latest FROM files').get() as { latest: number };
+    return latestSourceMtime(rootDir, files) > indexed.latest + 1;
+}
+
+export async function runMcpServer(pathArg?: string, options?: { watch?: boolean }): Promise<void> {
+    const rootDir = resolveMcpRoot(pathArg);
 
     const startTime = performance.now();
 
@@ -30,18 +140,64 @@ export async function runMcpServer(): Promise<void> {
         process.exit(1);
     }
 
-    // Start file watcher inside MCP server process
     let watcher: any;
-    try {
-        watcher = await startWatcher(rootDir, db, (file) => {
-            process.stderr.write(`[codex-mcp] reindexed: ${file}\n`);
-        });
-    } catch (err) {
-        process.stderr.write(`[codex-mcp] Watcher failed to start: ${err}\n`);
-    }
+    let shuttingDown = false;
+    let recoveryPromise: Promise<void> | null = null;
+    let lastFreshnessCheck = 0;
 
     // Pre-warm statement cache + SQLite page cache
     try { getStats(db); search(db, 'a', 1); } catch { /* warm-up, ignore errors */ }
+
+    function scheduleIndexRecovery(reason: string): Promise<void> {
+        if (!recoveryPromise) {
+            recoveryPromise = Promise.resolve().then(() => {
+                const start = performance.now();
+                process.stderr.write(`[codex-mcp] rebuilding index (${reason})...\n`);
+                const stats = indexProject(rootDir);
+                const elapsed = (performance.now() - start).toFixed(0);
+                process.stderr.write(
+                    `[codex-mcp] rebuilt index in ${elapsed}ms (${stats.totalFiles} files, ${stats.symbols} symbols)\n`
+                );
+            }).finally(() => {
+                recoveryPromise = null;
+            });
+        }
+        return recoveryPromise;
+    }
+
+    async function ensureIndexReady(): Promise<void> {
+        if (recoveryPromise) {
+            await recoveryPromise;
+            return;
+        }
+
+        try {
+            const stats = getStats(db);
+            if (needsIndexRecovery(rootDir, stats)) {
+                await scheduleIndexRecovery('empty index');
+                return;
+            }
+
+            const now = performance.now();
+            if (now - lastFreshnessCheck > 5000) {
+                lastFreshnessCheck = now;
+                if (indexLooksStale(rootDir, db, stats)) {
+                    await scheduleIndexRecovery('stale index');
+                }
+            }
+        } catch (err) {
+            await scheduleIndexRecovery(`stats failed: ${(err as Error).message}`);
+        }
+    }
+
+    try {
+        const stats = getStats(db);
+        if (needsIndexRecovery(rootDir, stats)) {
+            void scheduleIndexRecovery('startup empty index');
+        }
+    } catch {
+        void scheduleIndexRecovery('startup stats failed');
+    }
 
     const server = new Server(
         { name: 'claude-ex', version: '1.0.0' },
@@ -149,6 +305,44 @@ export async function runMcpServer(): Promise<void> {
                 },
             },
             {
+                name: 'get_file_context',
+                description: 'Build the best structural context around one or more files: key symbols, exports, imports, importers, packages, callers, transitive dependents, and ranked related files. Use before editing or reviewing files.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        files: {
+                            type: 'array',
+                            items: { type: 'string' },
+                            description: 'File paths relative to project root, or absolute paths',
+                        },
+                        maxSymbols: { type: 'number', description: 'Max symbols per file (default 30)' },
+                        maxRelated: { type: 'number', description: 'Max related files to return (default 20)' },
+                        includeCode: { type: 'boolean', description: 'Include stored symbol code snippets for top symbols (default false)' },
+                    },
+                    required: ['files'],
+                },
+            },
+            {
+                name: 'get_task_context',
+                description: 'One-shot AI context builder. Given a task or symbol query plus optional files, returns ranked symbols, matched files, selected file context, dependency/importer/caller context, and related files in one MCP call.',
+                inputSchema: {
+                    type: 'object' as const,
+                    properties: {
+                        query: { type: 'string', description: 'Natural-language task, symbol name, or file-ish query' },
+                        files: {
+                            type: 'array',
+                            items: { type: 'string' },
+                            description: 'Optional files to pin into the context first',
+                        },
+                        maxSymbols: { type: 'number', description: 'Max symbol matches and per-file symbols (default 12)' },
+                        maxFiles: { type: 'number', description: 'Max selected files (default 8)' },
+                        maxRelated: { type: 'number', description: 'Max related files (default 12)' },
+                        includeCode: { type: 'boolean', description: 'Include stored symbol code snippets (default false)' },
+                    },
+                    required: ['query'],
+                },
+            },
+            {
                 name: 'find_by_kind',
                 description: 'Find all symbols of a specific kind (class, function, interface, type, enum, method, variable). Ranked by structural importance.',
                 inputSchema: {
@@ -234,6 +428,7 @@ export async function runMcpServer(): Promise<void> {
 
         try {
             let result: any;
+            await ensureIndexReady();
 
             switch (name) {
                 case 'search_code':
@@ -249,7 +444,7 @@ export async function runMcpServer(): Promise<void> {
                     result = getCallers(db, (args as any).name);
                     break;
                 case 'get_dependents':
-                    result = getImpact(db, (args as any).file, (args as any).maxDepth);
+                    result = getImpact(db, normalizeFileArg(rootDir, (args as any).file), (args as any).maxDepth);
                     break;
                 case 'get_dependencies':
                     result = getDeps(db, (args as any).name);
@@ -268,7 +463,48 @@ export async function runMcpServer(): Promise<void> {
                     result = findFiles(db, (args as any).pattern, (args as any).limit);
                     break;
                 case 'get_file_symbols':
-                    result = getFileSymbols(db, (args as any).file);
+                    {
+                        const file = normalizeFileArg(rootDir, (args as any).file);
+                        if (fileExists(rootDir, file)) {
+                            reindexFile(rootDir, file, db);
+                        }
+                        result = getFileSymbols(db, file);
+                        if (result.length === 0 && fileExists(rootDir, file)) {
+                            result = readLiveFileSymbols(rootDir, file);
+                        }
+                    }
+                    break;
+                case 'get_file_context':
+                    {
+                        const files = normalizeFileList(rootDir, (args as any).files);
+                        for (const file of files) {
+                            if (fileExists(rootDir, file)) {
+                                reindexFile(rootDir, file, db);
+                            }
+                        }
+                        result = getFileContext(db, files, {
+                            maxSymbols: (args as any).maxSymbols,
+                            maxRelated: (args as any).maxRelated,
+                            includeCode: !!(args as any).includeCode,
+                        });
+                    }
+                    break;
+                case 'get_task_context':
+                    {
+                        const files = normalizeFileList(rootDir, (args as any).files ?? []);
+                        for (const file of files) {
+                            if (fileExists(rootDir, file)) {
+                                reindexFile(rootDir, file, db);
+                            }
+                        }
+                        result = getTaskContext(db, (args as any).query, {
+                            files,
+                            maxSymbols: (args as any).maxSymbols,
+                            maxFiles: (args as any).maxFiles,
+                            maxRelated: (args as any).maxRelated,
+                            includeCode: !!(args as any).includeCode,
+                        });
+                    }
                     break;
                 case 'find_by_kind':
                     result = findByKind(db, (args as any).kind, (args as any).limit);
@@ -284,7 +520,7 @@ export async function runMcpServer(): Promise<void> {
                     break;
                 case 'reindex_file': {
                     const fileStart = performance.now();
-                    reindexFile(rootDir, (args as any).file, db);
+                    reindexFile(rootDir, normalizeFileArg(rootDir, (args as any).file), db, { force: true });
                     result = { success: true, timeMs: +(performance.now() - fileStart).toFixed(1) };
                     break;
                 }
@@ -330,8 +566,24 @@ export async function runMcpServer(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
+    const watchEnabled = options?.watch ?? process.env.CLAUDE_EX_WATCH !== '0';
+    if (watchEnabled) {
+        startWatcher(rootDir, db, (file) => {
+            process.stderr.write(`[codex-mcp] reindexed: ${file}\n`);
+        }).then((startedWatcher) => {
+            if (shuttingDown) {
+                startedWatcher.close();
+                return;
+            }
+            watcher = startedWatcher;
+        }).catch((err) => {
+            process.stderr.write(`[codex-mcp] Watcher failed to start: ${err}\n`);
+        });
+    }
+
     // Graceful shutdown
     const shutdown = () => {
+        shuttingDown = true;
         process.stderr.write('[codex-mcp] Shutting down...\n');
         if (watcher) watcher.close();
         db.close();

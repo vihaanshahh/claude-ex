@@ -60,6 +60,8 @@ describe('openDatabase', () => {
         expect(names).toContain('idx_files_path');
         expect(names).toContain('idx_symbols_file');
         expect(names).toContain('idx_symbols_name');
+        expect(names).toContain('idx_symbols_name_nocase');
+        expect(names).toContain('idx_symbols_qualified_nocase');
         expect(names).toContain('idx_symbols_file_line');
         expect(names).toContain('idx_edges_to');
         expect(names).toContain('idx_edges_from');

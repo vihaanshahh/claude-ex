@@ -3,15 +3,39 @@ import * as path from 'path';
 import * as child_process from 'child_process';
 import Database from 'better-sqlite3';
 import { reindexFile } from '../indexer';
+import { collectFiles } from '../indexer/collector';
 import { isSupportedFile } from '../indexer/parser';
 import { getCodexDir } from '../utils';
 
-const IGNORE_PATTERNS = [
-    '**/node_modules/**', '**/.git/**', '**/.codex/**', '**/.local/**', '**/dist/**',
-    '**/build/**', '**/out/**', '**/.next/**', '**/.nuxt/**',
-    '**/__pycache__/**', '**/target/**', '**/vendor/**', '**/coverage/**',
-    '**/.cache/**', '**/tmp/**', '**/temp/**',
-];
+const IGNORE_DIRS = new Set([
+    'node_modules', '.git', '.hg', '.svn', '.codex', '.claude', '.local',
+    'dist', 'build', 'out', '.next', '.nuxt', '__pycache__', '.pytest_cache',
+    'target', 'vendor', 'coverage', '.vscode', '.idea', 'venv', '.venv',
+    '.tox', 'bower_components', '.cache', '.parcel-cache', 'tmp', 'temp',
+    '.turbo', '.vercel', '.netlify',
+]);
+
+function shouldIgnorePath(rootDir: string, fullPath: string): boolean {
+    const absPath = path.isAbsolute(fullPath) ? fullPath : path.resolve(rootDir, fullPath);
+    const relPath = path.relative(rootDir, absPath);
+    if (!relPath || relPath === '') return false;
+    return relPath.split(path.sep).some(part => IGNORE_DIRS.has(part));
+}
+
+function getWatchTargets(rootDir: string): string[] {
+    const targets = new Set<string>();
+
+    for (const relPath of collectFiles(rootDir)) {
+        const parts = relPath.split(/[\\/]+/);
+        if (parts.length <= 1) {
+            targets.add(path.join(rootDir, relPath));
+        } else {
+            targets.add(path.join(rootDir, parts[0]));
+        }
+    }
+
+    return [...targets];
+}
 
 export async function startWatcher(
     rootDir: string,
@@ -20,8 +44,13 @@ export async function startWatcher(
 ): Promise<any> {
     const chokidar = await import('chokidar');
 
-    const watcher = chokidar.watch(rootDir, {
-        ignored: IGNORE_PATTERNS,
+    const watchTargets = getWatchTargets(rootDir);
+    if (watchTargets.length === 0) {
+        return { close: () => Promise.resolve() };
+    }
+
+    const watcher = chokidar.watch(watchTargets, {
+        ignored: (fullPath: string) => shouldIgnorePath(rootDir, fullPath),
         persistent: true,
         ignoreInitial: true,
         awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
@@ -30,19 +59,35 @@ export async function startWatcher(
     // Batch debounce: collect changed files, reindex in one burst
     const pendingFiles = new Set<string>();
     let batchTimeout: NodeJS.Timeout | null = null;
+    let flushing = false;
     const BATCH_DELAY = 300; // ms — wait for burst of saves to settle
+
+    function scheduleFlush() {
+        if (batchTimeout) clearTimeout(batchTimeout);
+        batchTimeout = setTimeout(flushBatch, BATCH_DELAY);
+    }
 
     function flushBatch() {
         batchTimeout = null;
+        if (flushing) {
+            scheduleFlush();
+            return;
+        }
+        flushing = true;
         const files = [...pendingFiles];
         pendingFiles.clear();
-        for (const relPath of files) {
-            try {
-                reindexFile(rootDir, relPath, db);
-                onReindex?.(relPath);
-            } catch (err) {
-                process.stderr.write(`[codex] reindex error ${relPath}: ${err}\n`);
+        try {
+            for (const relPath of files) {
+                try {
+                    reindexFile(rootDir, relPath, db);
+                    onReindex?.(relPath);
+                } catch (err) {
+                    process.stderr.write(`[codex] reindex error ${relPath}: ${err}\n`);
+                }
             }
+        } finally {
+            flushing = false;
+            if (pendingFiles.size > 0) scheduleFlush();
         }
     }
 
@@ -51,8 +96,7 @@ export async function startWatcher(
         if (!isSupportedFile(relPath)) return;
 
         pendingFiles.add(relPath);
-        if (batchTimeout) clearTimeout(batchTimeout);
-        batchTimeout = setTimeout(flushBatch, BATCH_DELAY);
+        scheduleFlush();
     }
 
     function handleDelete(fullPath: string) {
@@ -67,6 +111,15 @@ export async function startWatcher(
     watcher.on('change', handleChange);
     watcher.on('add', handleChange);
     watcher.on('unlink', handleDelete);
+    let closedAfterError = false;
+    watcher.on('error', (err: any) => {
+        const suffix = err?.path ? ` (${err.path})` : '';
+        process.stderr.write(`[codex] watcher error: ${err}${suffix}\n`);
+        if (!closedAfterError && (err?.code === 'EMFILE' || err?.code === 'ENOSPC')) {
+            closedAfterError = true;
+            watcher.close().catch(() => { /* ignore close errors */ });
+        }
+    });
 
     return watcher;
 }

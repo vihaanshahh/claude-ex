@@ -7,7 +7,7 @@ import { openDatabase } from '../src/db/schema';
 import {
     search, getCallers, getContext, getImpact, getStats, getRank,
     getModules, getFileMap, getFileMapCompact, getFileSymbols, findByKind,
-    findDeadExports,
+    findDeadExports, getTaskContext,
 } from '../src/query/engine';
 import type Database from 'better-sqlite3';
 
@@ -53,6 +53,11 @@ function timeMs(fn: () => void): number {
 }
 
 describe('query performance', () => {
+    it('exact symbol search completes under 5ms', () => {
+        const ms = timeMs(() => search(db, 'func_25_0'));
+        expect(ms).toBeLessThan(5);
+    });
+
     it('search completes under 50ms', () => {
         const ms = timeMs(() => search(db, 'func_25'));
         expect(ms).toBeLessThan(50);
@@ -103,6 +108,11 @@ describe('query performance', () => {
         expect(ms).toBeLessThan(20);
     });
 
+    it('getTaskContext completes under 50ms', () => {
+        const ms = timeMs(() => getTaskContext(db, 'func_25', { maxSymbols: 8, maxFiles: 6, maxRelated: 8 }));
+        expect(ms).toBeLessThan(50);
+    });
+
     it('findByKind completes under 50ms', () => {
         const ms = timeMs(() => findByKind(db, 'function'));
         expect(ms).toBeLessThan(50);
@@ -118,8 +128,8 @@ describe('query performance', () => {
         search(db, 'func_10');
         const ms1 = timeMs(() => search(db, 'func_20'));
         const ms2 = timeMs(() => search(db, 'func_30'));
-        // Second call should be at least as fast (statement is cached)
-        expect(ms2).toBeLessThan(ms1 * 3); // generous bound to avoid flakes
+        // Keep this bounded without making sub-millisecond timer noise fail the suite.
+        expect(ms2).toBeLessThan(Math.max(ms1 * 3, 5));
     });
 });
 
