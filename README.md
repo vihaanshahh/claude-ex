@@ -15,6 +15,14 @@ claude-ex init
 
 That's it. Open Claude Code — the MCP server starts automatically and gives Claude structural awareness of your entire codebase.
 
+For Codex, register it during init:
+
+```bash
+claude-ex init --codex
+```
+
+That also writes a marker-safe `AGENTS.md` snippet and runs `codex mcp add claude-ex -- claude-ex mcp --no-watch /path/to/project`.
+
 ## How It Works
 
 1. **Indexes** your codebase using tree-sitter (functions, classes, methods, imports, call graphs)
@@ -195,6 +203,8 @@ In Claude Code, type:
 | `get_dependencies` | What a symbol depends on | <3ms |
 | `get_file_map` | Every file and its exports | <5ms |
 | `get_file_symbols` | All symbols in a file | <3ms |
+| `get_file_context` | Best context around files: symbols, imports, importers, callers, related files | <30ms |
+| `get_task_context` | One-shot AI context pack from task/query to symbols, files, and related context | <50ms |
 | `find_files` | Find files by glob pattern | <3ms |
 | `find_by_kind` | All classes, interfaces, enums, etc. | <5ms |
 | `get_type_hierarchy` | Subclasses/implementors | <3ms |
@@ -209,6 +219,7 @@ In Claude Code, type:
 
 ```
 claude-ex init [path]                  Index + install config + generate docs
+claude-ex init [path] --codex          Also register the MCP server with Codex + write AGENTS.md
 claude-ex transparent-review [target]  Zero-black-box review (before/after code, English, blast radius)
 claude-ex review [target]              Graph-aware diff review (structured JSON)
 claude-ex search <query>               Search symbols
@@ -223,7 +234,7 @@ claude-ex brief                        Project summary (SessionStart hook)
 claude-ex pre-edit <file>              Pre-edit context (PreToolUse hook)
 claude-ex post-edit <file>             Post-edit reindex (PostToolUse hook)
 claude-ex generate-docs                Regenerate CLAUDE.md
-claude-ex mcp                          Run as MCP server
+claude-ex mcp [path] [--no-watch]      Run as MCP server
 claude-ex uninstall                    Remove all config
 ```
 

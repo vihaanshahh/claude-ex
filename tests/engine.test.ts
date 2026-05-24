@@ -6,7 +6,7 @@ import { openDatabase, getOrCreateFile, insertSymbol, insertEdge, insertFileDep,
 import {
     search, getCallers, getContext, getImpact, getDeps, getRank,
     getModules, getStats, findFiles, getFileMap, getFileMapCompact,
-    getFileSymbols, findByKind, getTypeHierarchy, findDeadExports, getPkgUsages,
+    getFileSymbols, getFileContext, getTaskContext, findByKind, getTypeHierarchy, findDeadExports, getPkgUsages,
 } from '../src/query/engine';
 import type Database from 'better-sqlite3';
 
@@ -87,6 +87,13 @@ describe('search', () => {
     it('finds symbols by name', () => {
         seedTestData();
         const results = search(db, 'formatDate');
+        expect(results.length).toBeGreaterThan(0);
+        expect(results[0].name).toBe('formatDate');
+    });
+
+    it('uses case-insensitive exact symbol matches', () => {
+        seedTestData();
+        const results = search(db, 'formatdate');
         expect(results.length).toBeGreaterThan(0);
         expect(results[0].name).toBe('formatDate');
     });
@@ -297,6 +304,60 @@ describe('getFileSymbols', () => {
 
     it('returns empty for unknown file', () => {
         expect(getFileSymbols(db, 'nonexistent.ts').length).toBe(0);
+    });
+});
+
+describe('getFileContext', () => {
+    it('builds ranked context around a file', () => {
+        seedTestData();
+        const context = getFileContext(db, ['src/utils.ts'], { maxSymbols: 10, maxRelated: 10 });
+
+        expect(context.files).toHaveLength(1);
+        expect(context.files[0].path).toBe('src/utils.ts');
+        expect(context.files[0].exports.some(s => s.name === 'formatDate')).toBe(true);
+        expect(context.files[0].importedBy.map(i => i.file)).toContain('src/index.ts');
+        expect(context.files[0].importedBy.map(i => i.file)).toContain('src/api/handler.ts');
+
+        const related = context.relatedFiles.map(r => r.file);
+        expect(related).toContain('src/index.ts');
+        expect(related).toContain('src/api/handler.ts');
+        expect(context.relatedFiles.some(r => r.reasons.some(reason => reason.includes('calls exported symbols')))).toBe(true);
+    });
+
+    it('returns package imports for input files', () => {
+        seedTestData();
+        const context = getFileContext(db, ['src/api/handler.ts']);
+        expect(context.files[0].packages).toEqual([{ package: 'express', importedNames: 'Router' }]);
+    });
+});
+
+describe('getTaskContext', () => {
+    it('builds context from a task query', () => {
+        seedTestData();
+        const context = getTaskContext(db, 'formatDate handler', {
+            maxSymbols: 5,
+            maxFiles: 5,
+            maxRelated: 5,
+        });
+
+        expect(context.topSymbols.some(s => s.name === 'formatDate')).toBe(true);
+        expect(context.selectedFiles).toContain('src/utils.ts');
+        expect(context.fileContext.files.some(f => f.path === 'src/utils.ts')).toBe(true);
+        expect(context.fileContext.files.some(f =>
+            f.importedBy.some(imp => imp.file === 'src/index.ts' || imp.file === 'src/api/handler.ts')
+        )).toBe(true);
+        expect(context.notes.length).toBeGreaterThan(0);
+    });
+
+    it('pins explicit files before discovered files', () => {
+        seedTestData();
+        const context = getTaskContext(db, 'formatDate', {
+            files: ['src/api/handler.ts'],
+            maxFiles: 2,
+        });
+
+        expect(context.selectedFiles[0]).toBe('src/api/handler.ts');
+        expect(context.fileContext.files.some(f => f.path === 'src/api/handler.ts')).toBe(true);
     });
 });
 

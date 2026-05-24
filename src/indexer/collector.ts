@@ -95,5 +95,5 @@ export function collectFiles(rootDir: string): string[] {
     }
 
     walk(rootDir);
-    return files;
+    return files.sort();
 }

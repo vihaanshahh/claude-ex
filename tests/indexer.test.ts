@@ -71,14 +71,6 @@ import { helper } from './utils';
 export function run() { return helper(); }
 `);
 
-        // First index creates file records; second pass resolves deps
-        // (deps to files processed later in alphabetical order may need 2nd pass)
-        indexProject(tmpDir);
-        // Touch app.ts to force re-index so it can find utils.ts's file record
-        writeFile('src/app.ts', `
-import { helper } from './utils';
-export function run() { return helper() + 1; }
-`);
         indexProject(tmpDir);
 
         const db = openDatabase(tmpDir);
@@ -90,6 +82,31 @@ export function run() { return helper() + 1; }
                 JOIN files f2 ON f2.id = fd.to_file
             `).all() as { from_path: string; to_path: string }[];
             expect(deps.some(d => d.from_path === 'src/app.ts' && d.to_path === 'src/utils.ts')).toBe(true);
+        } finally {
+            db.close();
+        }
+    });
+
+    it('resolves imports to files created later in the same indexing pass', () => {
+        writeFile('src/a.ts', `
+import { zed } from './z';
+export function run() { return zed(); }
+`);
+        writeFile('src/z.ts', `
+export function zed() { return 1; }
+`);
+
+        indexProject(tmpDir);
+
+        const db = openDatabase(tmpDir);
+        try {
+            const deps = db.prepare(`
+                SELECT f1.path as from_path, f2.path as to_path
+                FROM file_deps fd
+                JOIN files f1 ON f1.id = fd.from_file
+                JOIN files f2 ON f2.id = fd.to_file
+            `).all() as { from_path: string; to_path: string }[];
+            expect(deps.some(d => d.from_path === 'src/a.ts' && d.to_path === 'src/z.ts')).toBe(true);
         } finally {
             db.close();
         }
@@ -151,6 +168,23 @@ export function bar() { return 2; }
             reindexFile(tmpDir, 'src/a.ts', db);
             const syms = getFileSymbols(db, 'src/a.ts');
             expect(syms.some(s => s.name === 'bar')).toBe(true);
+        } finally {
+            db.close();
+        }
+    });
+
+    it('can force reindex a file even when the content hash is unchanged', () => {
+        writeFile('src/a.ts', 'export function foo() { return 1; }');
+        indexProject(tmpDir);
+
+        const db = openDatabase(tmpDir);
+        try {
+            const file = db.prepare('SELECT id FROM files WHERE path = ?').get('src/a.ts') as { id: number };
+            db.prepare('DELETE FROM symbols WHERE file_id = ?').run(file.id);
+            expect(getFileSymbols(db, 'src/a.ts')).toHaveLength(0);
+
+            reindexFile(tmpDir, 'src/a.ts', db, { force: true });
+            expect(getFileSymbols(db, 'src/a.ts').some(s => s.name === 'foo')).toBe(true);
         } finally {
             db.close();
         }

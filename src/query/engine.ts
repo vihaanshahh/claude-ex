@@ -75,16 +75,76 @@ function sanitizeFts(query: string): string {
     return `(${phrase}) OR (${orFallback})`;
 }
 
+function isSimpleSymbolQuery(query: string): boolean {
+    return /^[\w.$-]+$/.test(query.trim());
+}
+
+function escapeLike(query: string): string {
+    return query.replace(/[\\%_]/g, ch => `\\${ch}`);
+}
+
+function pushUnique(results: SearchResult[], seen: Set<string>, rows: SearchResult[], limit: number): void {
+    for (const row of rows) {
+        const key = `${row.name}:${row.qualifiedName ?? ''}:${row.file}:${row.lineStart}`;
+        if (seen.has(key)) continue;
+        results.push(row);
+        seen.add(key);
+        if (results.length >= limit) return;
+    }
+}
+
 // --- DB-direct functions (for MCP server hot path) ---
 
 export function search(db: Database.Database, query: string, limit: number = 15): SearchResult[] {
-    const ftsQuery = sanitizeFts(query);
+    const cleanedQuery = query.trim();
+    if (!cleanedQuery) return [];
+
+    const boundedLimit = Math.max(1, Math.min(limit, 200));
+    const results: SearchResult[] = [];
+    const seen = new Set<string>();
+
+    if (isSimpleSymbolQuery(cleanedQuery)) {
+        const exactRows = cached(db, `
+            SELECT s.name, s.qualified_name as qualifiedName, s.kind, f.path as file,
+                   s.line_start as lineStart, s.line_end as lineEnd, s.signature,
+                   COALESCE(r.pagerank, 0) as pagerank
+            FROM symbols s
+            JOIN files f ON f.id = s.file_id
+            LEFT JOIN rankings r ON r.symbol_id = s.id
+            WHERE s.name = ? COLLATE NOCASE
+               OR s.qualified_name = ? COLLATE NOCASE
+            ORDER BY s.exported DESC, r.pagerank DESC, s.line_start
+            LIMIT ?
+        `).all(cleanedQuery, cleanedQuery, boundedLimit) as SearchResult[];
+        pushUnique(results, seen, exactRows, boundedLimit);
+        if (results.length >= boundedLimit) return results;
+
+        if (cleanedQuery.length >= 2) {
+            const prefix = `${escapeLike(cleanedQuery)}%`;
+            const prefixRows = cached(db, `
+                SELECT s.name, s.qualified_name as qualifiedName, s.kind, f.path as file,
+                       s.line_start as lineStart, s.line_end as lineEnd, s.signature,
+                       COALESCE(r.pagerank, 0) as pagerank
+                FROM symbols s
+                JOIN files f ON f.id = s.file_id
+                LEFT JOIN rankings r ON r.symbol_id = s.id
+                WHERE s.name COLLATE NOCASE LIKE ? ESCAPE '\\'
+                   OR s.qualified_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+                ORDER BY r.pagerank DESC, s.name
+                LIMIT ?
+            `).all(prefix, prefix, boundedLimit) as SearchResult[];
+            pushUnique(results, seen, prefixRows, boundedLimit);
+            if (results.length >= boundedLimit) return results;
+        }
+    }
+
+    const ftsQuery = sanitizeFts(cleanedQuery);
     if (!ftsQuery) return [];
 
     // Primary: FTS5 word-level search (fast, ranked)
-    const results = cached(db, `
-        SELECT s.name, s.qualified_name, s.kind, f.path as file,
-               s.line_start, s.line_end, s.signature,
+    const ftsRows = cached(db, `
+        SELECT s.name, s.qualified_name as qualifiedName, s.kind, f.path as file,
+               s.line_start as lineStart, s.line_end as lineEnd, s.signature,
                COALESCE(r.pagerank, 0) as pagerank
         FROM symbols_fts fts
         JOIN symbols s ON s.id = fts.rowid
@@ -93,20 +153,20 @@ export function search(db: Database.Database, query: string, limit: number = 15)
         WHERE symbols_fts MATCH ?
         ORDER BY r.pagerank DESC, fts.rank
         LIMIT ?
-    `).all(ftsQuery, limit) as SearchResult[];
+    `).all(ftsQuery, boundedLimit) as SearchResult[];
+    pushUnique(results, seen, ftsRows, boundedLimit);
 
     // If FTS has enough results, return immediately
-    if (results.length >= limit) return results;
+    if (results.length >= boundedLimit) return results;
 
     // Fallback: trigram substring search for partial/camelCase matches
     try {
-        const seenIds = new Set(results.map(r => `${r.name}:${r.file}`));
-        const cleaned = query.replace(/[^\w\s]/g, '').trim();
+        const cleaned = cleanedQuery.replace(/[^\w\s]/g, '').trim();
         if (cleaned.length < 3) return results;
 
         const trigramResults = cached(db, `
-            SELECT s.name, s.qualified_name, s.kind, f.path as file,
-                   s.line_start, s.line_end, s.signature,
+            SELECT s.name, s.qualified_name as qualifiedName, s.kind, f.path as file,
+                   s.line_start as lineStart, s.line_end as lineEnd, s.signature,
                    COALESCE(r.pagerank, 0) as pagerank
             FROM symbols_trigram tri
             JOIN symbols s ON s.id = tri.rowid
@@ -115,16 +175,8 @@ export function search(db: Database.Database, query: string, limit: number = 15)
             WHERE symbols_trigram MATCH ?
             ORDER BY r.pagerank DESC
             LIMIT ?
-        `).all(cleaned, limit) as SearchResult[];
-
-        for (const r of trigramResults) {
-            const key = `${r.name}:${r.file}`;
-            if (!seenIds.has(key)) {
-                results.push(r);
-                seenIds.add(key);
-                if (results.length >= limit) break;
-            }
-        }
+        `).all(cleaned, boundedLimit) as SearchResult[];
+        pushUnique(results, seen, trigramResults, boundedLimit);
     } catch {
         // Trigram table may not exist on older DBs
     }
@@ -521,6 +573,54 @@ export interface FileSymbolResult {
     parameters: string | null;
 }
 
+export interface FileContextSymbol extends FileSymbolResult {
+    pagerank: number;
+    code?: string | null;
+}
+
+export interface FileContextImport {
+    file: string;
+    importName: string | null;
+}
+
+export interface FileContextPackage {
+    package: string;
+    importedNames: string | null;
+}
+
+export interface FileContextFile {
+    path: string;
+    language: string | null;
+    lineCount: number;
+    symbols: FileContextSymbol[];
+    exports: FileContextSymbol[];
+    imports: FileContextImport[];
+    importedBy: FileContextImport[];
+    packages: FileContextPackage[];
+}
+
+export interface RelatedFileContext {
+    file: string;
+    score: number;
+    reasons: string[];
+    symbolCount: number;
+    exports: string[];
+}
+
+export interface FileContextResult {
+    files: FileContextFile[];
+    relatedFiles: RelatedFileContext[];
+}
+
+export interface TaskContextResult {
+    query: string;
+    topSymbols: SearchResult[];
+    matchedFiles: FileResult[];
+    selectedFiles: string[];
+    fileContext: FileContextResult;
+    notes: string[];
+}
+
 /** Get all symbols in a specific file */
 export function getFileSymbols(db: Database.Database, filePath: string): FileSymbolResult[] {
     return cached(db, `
@@ -531,6 +631,263 @@ export function getFileSymbols(db: Database.Database, filePath: string): FileSym
         WHERE f.path = ?
         ORDER BY s.line_start
     `).all(filePath) as FileSymbolResult[];
+}
+
+function addRelated(
+    related: Map<string, { score: number; reasons: Set<string> }>,
+    file: string,
+    score: number,
+    reason: string
+): void {
+    const current = related.get(file) || { score: 0, reasons: new Set<string>() };
+    current.score += score;
+    current.reasons.add(reason);
+    related.set(file, current);
+}
+
+/** Build a compact, ranked context bundle around one or more files. */
+export function getFileContext(
+    db: Database.Database,
+    filePaths: string[],
+    options?: { maxSymbols?: number; maxRelated?: number; includeCode?: boolean }
+): FileContextResult {
+    const maxSymbols = Math.max(1, Math.min(options?.maxSymbols ?? 30, 100));
+    const maxRelated = Math.max(0, Math.min(options?.maxRelated ?? 20, 100));
+    const includeCode = options?.includeCode ?? false;
+    const inputFiles = [...new Set(filePaths.filter(Boolean))];
+    const inputSet = new Set(inputFiles);
+    const related = new Map<string, { score: number; reasons: Set<string> }>();
+
+    const fileRows = cached(db, `
+        SELECT id, path, language, line_count as lineCount
+        FROM files
+        WHERE path = ?
+    `);
+    const symbolSql = includeCode ? `
+        SELECT s.name, s.qualified_name as qualifiedName, s.kind,
+               s.line_start as lineStart, s.line_end as lineEnd,
+               s.signature, s.exported, s.parameters, s.content as code,
+               COALESCE(r.pagerank, 0) as pagerank
+        FROM symbols s
+        LEFT JOIN rankings r ON r.symbol_id = s.id
+        WHERE s.file_id = ?
+        ORDER BY s.exported DESC, COALESCE(r.pagerank, 0) DESC, s.line_start
+        LIMIT ?
+    ` : `
+        SELECT s.name, s.qualified_name as qualifiedName, s.kind,
+               s.line_start as lineStart, s.line_end as lineEnd,
+               s.signature, s.exported, s.parameters,
+               COALESCE(r.pagerank, 0) as pagerank
+        FROM symbols s
+        LEFT JOIN rankings r ON r.symbol_id = s.id
+        WHERE s.file_id = ?
+        ORDER BY s.exported DESC, COALESCE(r.pagerank, 0) DESC, s.line_start
+        LIMIT ?
+    `;
+    const symbolsStmt = cached(db, symbolSql);
+    const importsStmt = cached(db, `
+        SELECT f.path as file, fd.import_name as importName
+        FROM file_deps fd
+        JOIN files f ON f.id = fd.to_file
+        WHERE fd.from_file = ?
+        ORDER BY f.path
+    `);
+    const importedByStmt = cached(db, `
+        SELECT f.path as file, fd.import_name as importName
+        FROM file_deps fd
+        JOIN files f ON f.id = fd.from_file
+        WHERE fd.to_file = ?
+        ORDER BY f.path
+    `);
+    const packagesStmt = cached(db, `
+        SELECT package, imported_names as importedNames
+        FROM pkg_deps
+        WHERE file_id = ?
+        ORDER BY package
+    `);
+    const callerFilesStmt = cached(db, `
+        SELECT f.path as file, GROUP_CONCAT(DISTINCT target.name) as symbols
+        FROM edges e
+        JOIN symbols target ON target.id = e.to_id
+        JOIN symbols caller ON caller.id = e.from_id
+        JOIN files f ON f.id = caller.file_id
+        WHERE target.file_id = ?
+          AND target.exported = 1
+          AND caller.file_id != target.file_id
+          AND e.kind IN ('calls', 'references')
+        GROUP BY f.path
+    `);
+
+    const files: FileContextFile[] = [];
+
+    for (const filePath of inputFiles) {
+        const file = fileRows.get(filePath) as { id: number; path: string; language: string | null; lineCount: number } | undefined;
+        if (!file) continue;
+
+        const symbols = symbolsStmt.all(file.id, maxSymbols) as FileContextSymbol[];
+        const imports = importsStmt.all(file.id) as FileContextImport[];
+        const importedBy = importedByStmt.all(file.id) as FileContextImport[];
+        const packages = packagesStmt.all(file.id) as FileContextPackage[];
+
+        for (const imp of imports) {
+            if (!inputSet.has(imp.file)) {
+                addRelated(related, imp.file, 30, `imported by ${file.path}`);
+            }
+        }
+        for (const dep of importedBy) {
+            if (!inputSet.has(dep.file)) {
+                addRelated(related, dep.file, 45, `imports ${file.path}`);
+            }
+        }
+        const callerFiles = callerFilesStmt.all(file.id) as { file: string; symbols: string | null }[];
+        for (const caller of callerFiles) {
+            if (!inputSet.has(caller.file)) {
+                const suffix = caller.symbols ? ` (${caller.symbols})` : '';
+                addRelated(related, caller.file, 55, `calls exported symbols from ${file.path}${suffix}`);
+            }
+        }
+        for (const impact of getImpact(db, file.path, 3)) {
+            if (!inputSet.has(impact.file)) {
+                addRelated(related, impact.file, Math.max(5, 25 - impact.depth * 5), `${impact.depth}-hop dependent of ${file.path}`);
+            }
+        }
+
+        files.push({
+            path: file.path,
+            language: file.language,
+            lineCount: file.lineCount,
+            symbols,
+            exports: symbols.filter(s => !!s.exported),
+            imports,
+            importedBy,
+            packages,
+        });
+    }
+
+    const relatedRows = [...related.entries()]
+        .sort((a, b) => b[1].score - a[1].score || a[0].localeCompare(b[0]))
+        .slice(0, maxRelated);
+
+    const relatedFiles = relatedRows.map(([file, data]) => {
+        const meta = cached(db, `
+            SELECT f.id, COUNT(s.id) as symbolCount,
+                   GROUP_CONCAT(CASE WHEN s.exported = 1 THEN s.name || ' [' || s.kind || ']' END, '|||') as exportsStr
+            FROM files f
+            LEFT JOIN symbols s ON s.file_id = f.id
+            WHERE f.path = ?
+            GROUP BY f.id
+        `).get(file) as { id: number; symbolCount: number; exportsStr: string | null } | undefined;
+
+        return {
+            file,
+            score: data.score,
+            reasons: [...data.reasons],
+            symbolCount: meta?.symbolCount ?? 0,
+            exports: meta?.exportsStr ? meta.exportsStr.split('|||').filter(Boolean).slice(0, 12) : [],
+        };
+    });
+
+    return { files, relatedFiles };
+}
+
+function findFilesByText(db: Database.Database, query: string, limit: number): FileResult[] {
+    const cleaned = query.trim();
+    if (!cleaned) return [];
+
+    const rows: FileResult[] = [];
+    const seen = new Set<string>();
+
+    if (cleaned.includes('*') || cleaned.includes('/') || cleaned.includes('.')) {
+        for (const row of findFiles(db, cleaned, limit)) {
+            rows.push(row);
+            seen.add(row.path);
+            if (rows.length >= limit) return rows;
+        }
+    }
+
+    const tokens = cleaned
+        .replace(/[^\w.\-/]/g, ' ')
+        .split(/\s+/)
+        .filter(token => token.length >= 2)
+        .slice(0, 4);
+
+    for (const token of tokens) {
+        const like = `%${escapeLike(token)}%`;
+        const matches = cached(db, `
+            SELECT path, language, line_count as lineCount
+            FROM files
+            WHERE path LIKE ? ESCAPE '\\'
+            ORDER BY
+                CASE WHEN path LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
+                LENGTH(path),
+                path
+            LIMIT ?
+        `).all(like, `${escapeLike(token)}%`, limit) as FileResult[];
+
+        for (const match of matches) {
+            if (seen.has(match.path)) continue;
+            rows.push(match);
+            seen.add(match.path);
+            if (rows.length >= limit) return rows;
+        }
+    }
+
+    return rows;
+}
+
+/** One-shot context builder for AI agents: query -> relevant symbols/files/context. */
+export function getTaskContext(
+    db: Database.Database,
+    query: string,
+    options?: {
+        files?: string[];
+        maxSymbols?: number;
+        maxFiles?: number;
+        maxRelated?: number;
+        includeCode?: boolean;
+    }
+): TaskContextResult {
+    const maxSymbols = Math.max(1, Math.min(options?.maxSymbols ?? 12, 50));
+    const maxFiles = Math.max(1, Math.min(options?.maxFiles ?? 8, 30));
+    const maxRelated = Math.max(0, Math.min(options?.maxRelated ?? 12, 50));
+    const explicitFiles = [...new Set((options?.files ?? []).filter(Boolean))];
+    const topSymbols = search(db, query, maxSymbols);
+    const matchedFiles = findFilesByText(db, query, maxFiles);
+
+    const selected = new Map<string, number>();
+    for (const file of explicitFiles) selected.set(file, 1000);
+    for (let i = 0; i < topSymbols.length; i++) {
+        selected.set(topSymbols[i].file, Math.max(selected.get(topSymbols[i].file) ?? 0, 500 - i));
+    }
+    for (let i = 0; i < matchedFiles.length; i++) {
+        selected.set(matchedFiles[i].path, Math.max(selected.get(matchedFiles[i].path) ?? 0, 300 - i));
+    }
+
+    const selectedFiles = [...selected.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, maxFiles)
+        .map(([file]) => file);
+
+    const fileContext = getFileContext(db, selectedFiles, {
+        maxSymbols,
+        maxRelated,
+        includeCode: options?.includeCode,
+    });
+
+    const notes: string[] = [];
+    if (explicitFiles.length > 0) notes.push(`${explicitFiles.length} explicit file(s) were pinned first.`);
+    if (topSymbols.length > 0) notes.push(`${topSymbols.length} ranked symbol match(es) were used to choose files.`);
+    if (matchedFiles.length > 0) notes.push(`${matchedFiles.length} path match(es) were considered.`);
+    if (selectedFiles.length === 0) notes.push('No indexed files matched the query.');
+
+    return {
+        query,
+        topSymbols,
+        matchedFiles,
+        selectedFiles,
+        fileContext,
+        notes,
+    };
 }
 
 /** Find symbols by kind (class, function, interface, type, enum, method, variable) */
@@ -1650,6 +2007,22 @@ export function briefFromRoot(rootDir: string): string {
 
 export function preEditContextFromRoot(rootDir: string, filePath: string): string {
     return withDb(rootDir, db => preEditContext(db, filePath));
+}
+
+export function getFileContextFromRoot(
+    rootDir: string,
+    files: string[],
+    options?: { maxSymbols?: number; maxRelated?: number; includeCode?: boolean }
+): FileContextResult {
+    return withDb(rootDir, db => getFileContext(db, files, options));
+}
+
+export function getTaskContextFromRoot(
+    rootDir: string,
+    query: string,
+    options?: { files?: string[]; maxSymbols?: number; maxFiles?: number; maxRelated?: number; includeCode?: boolean }
+): TaskContextResult {
+    return withDb(rootDir, db => getTaskContext(db, query, options));
 }
 
 export function reviewDiffFromRoot(rootDir: string, target?: string): ReviewDiffResult {

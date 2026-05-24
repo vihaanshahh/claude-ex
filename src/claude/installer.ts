@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { spawnSync, type SpawnSyncReturns } from 'child_process';
 
 const SKILL_CONTENT = `---
 name: claude-ex
@@ -159,8 +160,52 @@ For each changed file with symbols:
 - Prioritized list of action items if any
 `;
 
-export function install(rootDir: string, options?: { work?: boolean }): void {
+const AGENTS_MARKER_START = '<!-- claude-ex:agents:start -->';
+const AGENTS_MARKER_END = '<!-- claude-ex:agents:end -->';
+
+const AGENTS_CONTENT = `${AGENTS_MARKER_START}
+# claude-ex
+
+Use the \`claude-ex\` MCP server for structural codebase tasks before falling back to broad text search.
+
+Prefer MCP for:
+- symbol search and code discovery
+- callers, dependents, dependencies, and type hierarchy
+- architecture, file maps, and package usage
+- graph-aware diff review
+
+Use the following tools when they match the task:
+- \`search_code\`
+- \`get_symbol\`
+- \`get_callers\`
+- \`get_dependents\`
+- \`get_dependencies\`
+- \`get_architecture\`
+- \`get_file_map\`
+- \`find_files\`
+- \`get_file_symbols\`
+- \`get_file_context\`
+- \`get_task_context\`
+- \`find_by_kind\`
+- \`get_type_hierarchy\`
+- \`find_dead_exports\`
+- \`get_pkg_usages\`
+- \`review_diff\`
+- \`transparent_review\`
+
+Use grep/ripgrep for plain text and regex-only searches like TODOs, exact literals, or log lines.
+${AGENTS_MARKER_END}
+`;
+
+type CommandRunner = (
+    command: string,
+    args: string[],
+    options: { cwd: string; encoding: BufferEncoding }
+) => SpawnSyncReturns<string>;
+
+export function install(rootDir: string, options?: { work?: boolean; codex?: boolean; commandRunner?: CommandRunner }): void {
     const work = options?.work ?? false;
+    const codex = options?.codex ?? false;
 
     if (work) {
         // Work mode: data goes in .local/.codex/, config stays at root but is gitignored
@@ -171,6 +216,7 @@ export function install(rootDir: string, options?: { work?: boolean }): void {
         addToGitignore(rootDir, '.local/');
         addToGitignore(rootDir, '.claude/');
         addToGitignore(rootDir, '.mcp.json');
+        if (codex) addToGitignore(rootDir, 'AGENTS.md');
     } else {
         // Normal mode: .codex/ at root
         const codexDir = path.join(rootDir, '.codex');
@@ -189,6 +235,11 @@ export function install(rootDir: string, options?: { work?: boolean }): void {
     // 4. Create skill files
     installSkill(rootDir);
     installReviewSkill(rootDir);
+
+    if (codex) {
+        installAgentsMd(rootDir);
+        installCodexMcp(rootDir, options?.commandRunner ?? spawnSync);
+    }
 }
 
 function addToGitignore(rootDir: string, entry: string): void {
@@ -220,7 +271,7 @@ function installMcpConfig(rootDir: string): void {
     config.mcpServers.codex = {
         type: 'stdio',
         command: 'claude-ex',
-        args: ['mcp'],
+        args: ['mcp', rootDir],
     };
 
     fs.writeFileSync(mcpPath, JSON.stringify(config, null, 2) + '\n');
@@ -313,4 +364,59 @@ function installReviewSkill(rootDir: string): void {
     const skillDir = path.join(rootDir, '.claude', 'skills', 'review');
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(path.join(skillDir, 'SKILL.md'), REVIEW_SKILL_CONTENT);
+}
+
+function installAgentsMd(rootDir: string): void {
+    const agentsPath = path.join(rootDir, 'AGENTS.md');
+    let updated = AGENTS_CONTENT;
+
+    if (fs.existsSync(agentsPath)) {
+        const existing = fs.readFileSync(agentsPath, 'utf-8');
+        const start = existing.indexOf(AGENTS_MARKER_START);
+        const end = existing.indexOf(AGENTS_MARKER_END);
+
+        if (start !== -1 && end !== -1 && end > start) {
+            updated = existing.slice(0, start) + AGENTS_CONTENT + existing.slice(end + AGENTS_MARKER_END.length);
+        } else if (!existing.includes(AGENTS_MARKER_START)) {
+            updated = existing.trimEnd() + '\n\n' + AGENTS_CONTENT + '\n';
+        } else {
+            updated = existing;
+        }
+    }
+
+    if (!fs.existsSync(agentsPath) || fs.readFileSync(agentsPath, 'utf-8') !== updated) {
+        fs.writeFileSync(agentsPath, updated);
+    }
+}
+
+function installCodexMcp(rootDir: string, commandRunner: CommandRunner): void {
+    const addArgs = ['mcp', 'add', 'claude-ex', '--', 'claude-ex', 'mcp', '--no-watch', rootDir];
+    const existing = commandRunner('codex', ['mcp', 'get', 'claude-ex'], {
+        cwd: rootDir,
+        encoding: 'utf-8',
+    });
+
+    if (existing.status === 0) {
+        const current = `${existing.stdout || ''}\n${existing.stderr || ''}`;
+        if (current.includes(rootDir)) return;
+
+        const remove = commandRunner('codex', ['mcp', 'remove', 'claude-ex'], {
+            cwd: rootDir,
+            encoding: 'utf-8',
+        });
+        if (remove.status !== 0) {
+            const detail = (remove.stderr || remove.stdout || remove.error?.message || 'unknown error').trim();
+            throw new Error(`Failed to update existing Codex MCP server: ${detail}`);
+        }
+    }
+
+    const result = commandRunner('codex', addArgs, {
+        cwd: rootDir,
+        encoding: 'utf-8',
+    });
+
+    if (result.status !== 0) {
+        const detail = (result.stderr || result.stdout || result.error?.message || 'unknown error').trim();
+        throw new Error(`Failed to register Codex MCP server: ${detail}`);
+    }
 }
