@@ -583,6 +583,7 @@ export async function runMcpServer(pathArg?: string, options?: { watch?: boolean
 
     // Graceful shutdown
     const shutdown = () => {
+        if (shuttingDown) return;
         shuttingDown = true;
         process.stderr.write('[codex-mcp] Shutting down...\n');
         if (watcher) watcher.close();
@@ -592,4 +593,13 @@ export async function runMcpServer(pathArg?: string, options?: { watch?: boolean
 
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
+
+    // A stdio MCP server is owned by its client (e.g. Claude Code). If the
+    // client goes away without sending a signal, the OS reparents us to launchd
+    // and we keep running forever — each orphan holding a chokidar watcher that
+    // slowly leaks file descriptors until the system file table is exhausted.
+    // Exit as soon as the transport or stdin closes so orphans can't accumulate.
+    transport.onclose = shutdown;
+    process.stdin.on('end', shutdown);
+    process.stdin.on('close', shutdown);
 }
